@@ -166,6 +166,10 @@ def format_expiry_countdown(expiry_iso: str) -> str:
     hours = int(delta.total_seconds() // 3600)
     return f"{hours} hour{'s' if hours != 1 else ''}"
 
+def is_valid_account_number(value: str) -> bool:
+    """Account number must be exactly 10 digits."""
+    return value.isdigit() and len(value) == 10
+
 async def send_media_or_text(bot_or_ctx, chat_id: int, file_id, caption: str,
                               reply_markup=None, parse_mode="Markdown"):
     kwargs = dict(parse_mode=parse_mode, reply_markup=reply_markup)
@@ -399,8 +403,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💳 /pay — renew your SubPlanBot subscription\n\n"
             f"🔑 *Your Ref Code:* `{ref}`\n"
             f"🔗 *Deep Link:* `{ref_deep_link(ref)}`\n"
-            "_Share either with your members so they can subscribe instantly._\n"
-            "❓ Got questions? Reach out to @GizmoBrymez",
+            "_Share either with your members so they can subscribe instantly._",
             parse_mode="Markdown")
         return
 
@@ -539,21 +542,35 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         state["bank_name"] = text.strip()
         state["step"]      = STEP_ACCT_NUM
         CLIENT_STATE[uid]  = state
-        await update.message.reply_text("🔢 What's your *account number*?", parse_mode="Markdown")
+        await update.message.reply_text("🔢 What's your *account number*? _(must be exactly 10 digits)_", parse_mode="Markdown")
 
     elif step == STEP_ACCT_NUM:
-        state["account_number_tmp"] = text.strip()
+        val = text.strip()
+        if not is_valid_account_number(val):
+            await update.message.reply_text(
+                "⚠️ Account number must be *exactly 10 digits* and contain only numbers.\n\nPlease try again:",
+                parse_mode="Markdown")
+            return
+        state["account_number_tmp"] = val
         state["step"]               = STEP_ACCT_NUM2
         CLIENT_STATE[uid]           = state
         await update.message.reply_text("🔢 Please *confirm* your account number by entering it again:", parse_mode="Markdown")
 
     elif step == STEP_ACCT_NUM2:
-        if text.strip() != state.get("account_number_tmp"):
-            await update.message.reply_text("⚠️ Account numbers don't match. Please enter your account number again:")
+        val = text.strip()
+        if not is_valid_account_number(val):
+            await update.message.reply_text(
+                "⚠️ Account number must be *exactly 10 digits* and contain only numbers.\n\nPlease try again:",
+                parse_mode="Markdown")
+            return
+        if val != state.get("account_number_tmp"):
+            await update.message.reply_text(
+                "⚠️ Account numbers don't match. Please enter your account number again:",
+                parse_mode="Markdown")
             state["step"] = STEP_ACCT_NUM
             CLIENT_STATE[uid] = state
             return
-        state["account_number"] = text.strip()
+        state["account_number"] = val
         state.pop("account_number_tmp", None)
         state["step"]           = STEP_ACCT_NAME
         CLIENT_STATE[uid]       = state
@@ -567,21 +584,18 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "🖼️ *Payment Flyer* _(optional)_\n\n"
             "This is the image your members see when they use /pay.\n\n"
         )
+        skip_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭️ Skip", callback_data="onboard:skip_flyer")
+        ]])
         if FLYER_FILE_ID:
             flyer_msg += "Here's a sample flyer for reference 👆\n\nSend your own flyer image, or tap *Skip*."
             await context.bot.send_photo(
                 uid, photo=FLYER_FILE_ID,
                 caption=flyer_msg, parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⏭️ Skip", callback_data="onboard:skip_flyer")
-                ]]))
+                reply_markup=skip_kb)
         else:
             flyer_msg += "Send your flyer image now, or tap *Skip*."
-            await update.message.reply_text(
-                flyer_msg, parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⏭️ Skip", callback_data="onboard:skip_flyer")
-                ]]))
+            await update.message.reply_text(flyer_msg, parse_mode="Markdown", reply_markup=skip_kb)
 
     elif step == STEP_PACKAGES:
         parts = [p.strip() for p in text.split(",")]
@@ -621,7 +635,10 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text(
             f"✅ *Ref Code set:* `{custom}`\n"
             f"🔗 *Deep Link:* `{ref_deep_link(custom)}`\n\n"
-            "Now let's link your channel/group! 👇",
+            "Now let's link your channel/group! 👇\n\n"
+            "1️⃣ Tap *Add me to your channel/group* below\n"
+            "2️⃣ You may see a Telegram error — *ignore it*, I still get added!\n"
+            "3️⃣ Click *I've added the bot* once done.",
             parse_mode="Markdown",
             reply_markup=_channel_keyboard())
 
@@ -679,6 +696,10 @@ async def handle_onboarding_photo(update: Update, context: ContextTypes.DEFAULT_
         CLIENT_STATE.pop(uid, None)
         await update.message.reply_photo(photo=file_id, caption="✅ *Payment flyer updated!*", parse_mode="Markdown")
 
+    else:
+        # Not an onboarding photo step — treat as receipt
+        await handle_receipt(update, context)
+
 
 # ── Bot added to channel/group ─────────────────────────────────────────────────
 async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -726,7 +747,6 @@ async def handle_member_joined(update: Update, context: ContextTypes.DEFAULT_TYP
     pkg       = pending["pkg"]
     name      = pending["name"]
 
-    # Verify this join is for the right channel/group
     client = get_client(client_id)
     if not client or client["channel_id"] != chat_id:
         return
@@ -775,22 +795,47 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["brand_logo_id"] = None
         state["step"]          = STEP_BANK
         CLIENT_STATE[uid]      = state
-        await query.edit_message_text(
-            "👍 No logo — that's fine!\n\n"
-            "Now let's set up your *payment details* 💼\n\n"
-            "What's your *bank name*? _(e.g. Kuda Bank, GTBank)_",
-            parse_mode="Markdown")
+        # Edit caption if photo message, else edit text
+        try:
+            if query.message.photo:
+                await query.edit_message_caption(
+                    caption="👍 No logo — that's fine!\n\n"
+                            "Now let's set up your *payment details* 💼\n\n"
+                            "What's your *bank name*? _(e.g. Kuda Bank, GTBank)_",
+                    parse_mode="Markdown")
+            else:
+                await query.edit_message_text(
+                    "👍 No logo — that's fine!\n\n"
+                    "Now let's set up your *payment details* 💼\n\n"
+                    "What's your *bank name*? _(e.g. Kuda Bank, GTBank)_",
+                    parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(uid,
+                "👍 No logo — that's fine!\n\n"
+                "Now let's set up your *payment details* 💼\n\n"
+                "What's your *bank name*? _(e.g. Kuda Bank, GTBank)_",
+                parse_mode="Markdown")
 
     elif action == "skip_flyer":
         state["flyer_file_id"] = None
         state["step"]          = STEP_PACKAGES
         CLIENT_STATE[uid]      = state
-        await query.edit_message_text(
+        pkg_prompt = (
             "👍 No flyer — that's fine!\n\n"
             "📦 Now let's set up your *subscription packages*.\n\n"
             "Send each package in this format:\n`Package Name, Price, Duration in days`\n\n"
-            "Examples:\n`1 Month, 5000, 30`\n`3 Months, 12000, 90`",
-            parse_mode="Markdown")
+            "Examples:\n`1 Month, 5000, 30`\n`3 Months, 12000, 90`"
+        )
+        # The flyer prompt was sent as a photo (if FLYER_FILE_ID set) or text.
+        # Either way, send a fresh message — editing a photo caption with no reply_markup
+        # and then continuing is cleaner than trying to detect message type.
+        try:
+            if query.message.photo:
+                await query.edit_message_caption(caption=pkg_prompt, parse_mode="Markdown")
+            else:
+                await query.edit_message_text(pkg_prompt, parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(uid, pkg_prompt, parse_mode="Markdown")
 
     elif action == "add_pkg":
         state["step"] = STEP_PACKAGES
@@ -1198,14 +1243,12 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
     client = get_client(client_id)
     pkg    = client["packages"][pkg_idx]
 
-    # Save to PENDING_APPROVALS — expiry set when member actually joins
     PENDING_APPROVALS[user_id] = {
         "client_id": client_id,
         "pkg":       pkg,
         "name":      name
     }
 
-    # Insert a pending row so /status shows something
     now      = datetime.now(timezone.utc)
     existing = db.table("members").select("user_id").eq("user_id", user_id).eq("client_id", client_id).execute().data
     if existing:
@@ -1382,6 +1425,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step in [STEP_BRAND, STEP_BANK, STEP_ACCT_NUM, STEP_ACCT_NUM2, STEP_ACCT_NAME, STEP_PACKAGES, STEP_REF_CODE]:
             await handle_onboarding(update, context, uid)
             return
+        # STEP_FLYER — user sent text when we expect a photo or skip button
+        if step == STEP_FLYER:
+            await update.message.reply_text(
+                "📸 Please send an *image* for your payment flyer, or tap *Skip* below.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏭️ Skip", callback_data="onboard:skip_flyer")
+                ]]))
+            return
+        # STEP_BRAND_LOGO — user sent text when we expect a photo or skip button
+        if step == STEP_BRAND_LOGO:
+            await update.message.reply_text(
+                "📸 Please send an *image* for your brand logo, or tap *Skip* below.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏭️ Skip", callback_data="onboard:skip_logo")
+                ]]))
+            return
 
     if is_active_client(uid) and uid in CLIENT_STATE:
         step = state.get("step")
@@ -1397,18 +1458,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ *Bank name updated.*", parse_mode="Markdown")
             return
         elif step == SETTINGS_EDIT_ACCT_NUM:
-            state["account_number_tmp"] = text.strip()
+            val = text.strip()
+            if not is_valid_account_number(val):
+                await update.message.reply_text(
+                    "⚠️ Account number must be *exactly 10 digits* and contain only numbers.\n\nPlease try again:",
+                    parse_mode="Markdown")
+                return
+            state["account_number_tmp"] = val
             state["step"]               = SETTINGS_EDIT_ACCT_NUM2
             CLIENT_STATE[uid]           = state
             await update.message.reply_text("🔢 Please *confirm* by entering the account number again:", parse_mode="Markdown")
             return
         elif step == SETTINGS_EDIT_ACCT_NUM2:
-            if text.strip() != state.get("account_number_tmp"):
+            val = text.strip()
+            if not is_valid_account_number(val):
+                await update.message.reply_text(
+                    "⚠️ Account number must be *exactly 10 digits* and contain only numbers.\n\nPlease try again:",
+                    parse_mode="Markdown")
+                return
+            if val != state.get("account_number_tmp"):
                 await update.message.reply_text("⚠️ Numbers don't match. Please enter the account number again:")
                 state["step"] = SETTINGS_EDIT_ACCT_NUM
                 CLIENT_STATE[uid] = state
                 return
-            db.table("clients").update({"account_number": text.strip()}).eq("client_id", uid).execute()
+            db.table("clients").update({"account_number": val}).eq("client_id", uid).execute()
             CLIENT_STATE.pop(uid)
             await update.message.reply_text("✅ *Account number updated.*", parse_mode="Markdown")
             return
@@ -1557,7 +1630,7 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🏦 Send your new bank name:")
     elif action == "acct_num":
         CLIENT_STATE[uid] = {"step": SETTINGS_EDIT_ACCT_NUM}
-        await query.edit_message_text("💳 Send your new account number:")
+        await query.edit_message_text("💳 Send your new account number: _(must be exactly 10 digits)_", parse_mode="Markdown")
     elif action == "acct_name":
         CLIENT_STATE[uid] = {"step": SETTINGS_EDIT_ACCT_NAME}
         await query.edit_message_text("👤 Send your new account name:")
@@ -1622,7 +1695,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_chat_action(uid, "typing")
     update_last_seen(uid)
-    now     = datetime.now(timezone.utc).isoformat()
     members = db.table("members").select("user_id, username, expiry, package").eq("client_id", uid).eq("removed", False).order("expiry").execute().data
     if not members:
         await update.message.reply_text("📭 No active members yet.")
