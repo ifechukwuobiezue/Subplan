@@ -167,7 +167,6 @@ def format_expiry_countdown(expiry_iso: str) -> str:
     return f"{hours} hour{'s' if hours != 1 else ''}"
 
 def is_valid_account_number(value: str) -> bool:
-    """Account number must be exactly 10 digits."""
     return value.isdigit() and len(value) == 10
 
 async def send_media_or_text(bot_or_ctx, chat_id: int, file_id, caption: str,
@@ -317,20 +316,38 @@ def _inactivity_sync():
     asyncio.run(_do())
 
 
+# ── Channel/group keyboard ─────────────────────────────────────────────────────
+def _channel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Add me to your channel",
+            url=f"https://t.me/{BOT_USERNAME}?startchannel=setup&admin=invite_users+restrict_members+manage_chat")],
+        [InlineKeyboardButton("👥 Add me to your group",
+            url=f"https://t.me/{BOT_USERNAME}?startgroup=setup&admin=invite_users+restrict_members+manage_chat")],
+        [InlineKeyboardButton("✅ I've added the bot", callback_data="onboard:confirm_channel")]
+    ])
+
+
 # ── Channel/group verification helper ─────────────────────────────────────────
 async def process_channel_verification(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
     state = CLIENT_STATE.get(uid, {})
     if state.get("step") != STEP_CHANNEL:
         return False
 
+    # Only attempt forwarding for channels — groups block forward metadata
     channel_identifier = None
-    if getattr(update.message, "forward_from_chat", None) and update.message.forward_from_chat.type in ("channel", "supergroup", "group"):
+    if getattr(update.message, "forward_from_chat", None) and update.message.forward_from_chat.type == "channel":
         channel_identifier = update.message.forward_from_chat.id
     elif getattr(update.message, "forward_origin", None) and getattr(update.message.forward_origin, "chat", None):
-        channel_identifier = update.message.forward_origin.chat.id
+        if getattr(update.message.forward_origin.chat, "type", None) == "channel":
+            channel_identifier = update.message.forward_origin.chat.id
 
     if not channel_identifier:
-        await update.message.reply_text("⚠️ Please forward a message from your channel/group.")
+        await update.message.reply_text(
+            "⚠️ Forwarding only works for channels.\n\n"
+            "For *channels*: forward any message from your channel here.\n"
+            "For *groups*: use the *Add me to your group* button below — I'll detect it automatically once added as admin. 👇",
+            parse_mode="Markdown",
+            reply_markup=_channel_keyboard())
         return True
 
     await context.bot.send_chat_action(uid, "typing")
@@ -338,15 +355,23 @@ async def process_channel_verification(update: Update, context: ContextTypes.DEF
         chat       = await context.bot.get_chat(channel_identifier)
         bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
         if not isinstance(bot_member, (ChatMemberAdministrator, ChatMemberOwner)):
-            await update.message.reply_text("⚠️ I found the channel/group, but I'm not an admin yet. Please add me as an admin and try again.")
+            await update.message.reply_text(
+                "⚠️ I found the channel, but I'm not an admin yet. Please add me as an admin and try again.")
+            return True
+        if isinstance(bot_member, ChatMemberAdministrator) and not bot_member.can_restrict_members:
+            await update.message.reply_text(
+                "⚠️ I'm an admin but I don't have *Ban Members* permission.\n\n"
+                "Please go to the channel admin settings, find me, enable *Ban Members*, then try again.",
+                parse_mode="Markdown")
             return True
         state["channel_id"]   = chat.id
         state["channel_name"] = chat.title
         CLIENT_STATE[uid]     = state
         await _show_plan_selection(context.bot, uid, chat.title)
     except Exception as e:
-        logging.error(f"Channel/group verification failed: {e}")
-        await update.message.reply_text("⚠️ I couldn't access that channel/group. Please try forwarding a message from it.")
+        logging.error(f"Channel verification failed: {e}")
+        await update.message.reply_text(
+            "⚠️ I couldn't access that channel. Please try forwarding a message from it.")
     return True
 
 
@@ -372,10 +397,32 @@ async def _show_plan_selection(bot, uid: int, channel_name: str):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid  = user.id
+    chat = update.effective_chat
+
+    if chat.type in ("group", "supergroup"):
+        state = CLIENT_STATE.get(uid, {})
+        if state.get("step") == STEP_CHANNEL:
+            try:
+                bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+                if not isinstance(bot_member, (ChatMemberAdministrator, ChatMemberOwner)):
+                    await update.message.reply_text(
+                        "⚠️ I'm here but I need to be an admin with *Ban Users* enabled first.",
+                        parse_mode="Markdown")
+                    return
+                if isinstance(bot_member, ChatMemberAdministrator) and not bot_member.can_restrict_members:
+                    await update.message.reply_text(
+                        "⚠️ I'm an admin but *Ban Users* is off. Please enable it and run /start again.",
+                        parse_mode="Markdown")
+                    return
+                state["channel_id"]   = chat.id
+                state["channel_name"] = chat.title
+                CLIENT_STATE[uid]     = state
+                await _show_plan_selection(context.bot, uid, chat.title)
+            except Exception as e:logging.error(f"Group start detection failed: {e}")
+        return
 
     await context.bot.send_chat_action(uid, "typing")
 
-    # Deep-link ref code bypass
     if context.args:
         ref_code = context.args[0].upper()
         client   = get_client_by_ref(ref_code)
@@ -439,7 +486,9 @@ async def _show_subscription_info(update, context, uid: int, client: dict):
     packages = [p for p in (client.get("packages") or []) if not p.get("is_demo")]
     CLIENT_STATE[uid] = {"subscribing_to_client_id": client["client_id"], "step": None}
     if not packages:
-        await update.message.reply_text("⚠️ This channel/group has no active packages yet. Contact the admin.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⚠️ This channel/group has no active packages yet. Contact the admin.",
+            parse_mode="Markdown")
         return
     pkg_lines = "\n".join([f"• *{p['name']}* — ₦{p['price']} ({format_duration(p['duration_days'])})" for p in packages])
     caption   = (
@@ -542,7 +591,9 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         state["bank_name"] = text.strip()
         state["step"]      = STEP_ACCT_NUM
         CLIENT_STATE[uid]  = state
-        await update.message.reply_text("🔢 What's your *account number*? _(must be exactly 10 digits)_", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🔢 What's your *account number*? _(must be exactly 10 digits)_",
+            parse_mode="Markdown")
 
     elif step == STEP_ACCT_NUM:
         val = text.strip()
@@ -554,7 +605,9 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         state["account_number_tmp"] = val
         state["step"]               = STEP_ACCT_NUM2
         CLIENT_STATE[uid]           = state
-        await update.message.reply_text("🔢 Please *confirm* your account number by entering it again:", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🔢 Please *confirm* your account number by entering it again:",
+            parse_mode="Markdown")
 
     elif step == STEP_ACCT_NUM2:
         val = text.strip()
@@ -606,7 +659,9 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             return
         pkg_name, price, duration = parts[0], parts[1], parts[2]
         if not duration.isdigit():
-            await update.message.reply_text("⚠️ Duration must be a number of days. Example: `30`", parse_mode="Markdown")
+            await update.message.reply_text(
+                "⚠️ Duration must be a number of days. Example: `30`",
+                parse_mode="Markdown")
             return
         packages = state.get("packages", [])
         packages.append({"name": pkg_name, "price": price, "duration_days": int(duration)})
@@ -624,10 +679,12 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     elif step == STEP_REF_CODE:
         custom = text.strip().upper().replace(" ", "-")
         if len(custom) < 3 or len(custom) > 20:
-            await update.message.reply_text("⚠️ Ref code must be between 3 and 20 characters. Try again:")
+            await update.message.reply_text(
+                "⚠️ Ref code must be between 3 and 20 characters. Try again:")
             return
         if db.table("clients").select("ref_code").eq("ref_code", custom).execute().data:
-            await update.message.reply_text("⚠️ That code is already taken. Please try a different one:")
+            await update.message.reply_text(
+                "⚠️ That code is already taken. Please try a different one:")
             return
         state["ref_code"] = custom
         state["step"]     = STEP_CHANNEL
@@ -635,25 +692,16 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text(
             f"✅ *Ref Code set:* `{custom}`\n"
             f"🔗 *Deep Link:* `{ref_deep_link(custom)}`\n\n"
-            "Now let's link your channel/group! 👇\n\n"
-            "1️⃣ Tap *Add me to your channel/group* below\n"
-            "2️⃣ You may see a Telegram error — *ignore it*, I still get added!\n"
-            "3️⃣ Click *I've added the bot* once done.",
+            "Now let's link your channel or group! 👇",
             parse_mode="Markdown",
             reply_markup=_channel_keyboard())
 
     elif step == STEP_CHANNEL:
         await update.message.reply_text(
-            "📌 Please *forward a message* from your channel/group.",
-            parse_mode="Markdown")
-
-
-def _channel_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Add me to your channel/group",
-            url=f"https://t.me/{BOT_USERNAME}?startchannel=setup&admin=invite_users+ban_users+manage_chat")],
-        [InlineKeyboardButton("✅ I've added the bot", callback_data="onboard:confirm_channel")]
-    ])
+            "📌 Use the buttons below to add me to your channel or group.\n\n"
+            "For *channels* you can also forward any message from your channel here.",
+            parse_mode="Markdown",
+            reply_markup=_channel_keyboard())
 
 
 # ── Onboarding photos ──────────────────────────────────────────────────────────
@@ -688,16 +736,17 @@ async def handle_onboarding_photo(update: Update, context: ContextTypes.DEFAULT_
         file_id = update.message.photo[-1].file_id
         db.table("clients").update({"brand_logo_id": file_id}).eq("client_id", uid).execute()
         CLIENT_STATE.pop(uid, None)
-        await update.message.reply_photo(photo=file_id, caption="✅ *Brand logo updated!*", parse_mode="Markdown")
+        await update.message.reply_photo(
+            photo=file_id, caption="✅ *Brand logo updated!*", parse_mode="Markdown")
 
     elif step == SETTINGS_EDIT_FLYER:
         file_id = update.message.photo[-1].file_id
         db.table("clients").update({"flyer_file_id": file_id}).eq("client_id", uid).execute()
         CLIENT_STATE.pop(uid, None)
-        await update.message.reply_photo(photo=file_id, caption="✅ *Payment flyer updated!*", parse_mode="Markdown")
+        await update.message.reply_photo(
+            photo=file_id, caption="✅ *Payment flyer updated!*", parse_mode="Markdown")
 
     else:
-        # Not an onboarding photo step — treat as receipt
         await handle_receipt(update, context)
 
 
@@ -708,10 +757,27 @@ async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat       = result.chat
     new_status = result.new_chat_member
-    if chat.type not in ("channel", "supergroup", "group"):
+    if chat.type != "channel":
         return
     if not isinstance(new_status, (ChatMemberAdministrator, ChatMemberOwner)):
         return
+
+    # Check ban rights
+    if isinstance(new_status, ChatMemberAdministrator) and not new_status.can_restrict_members:
+        # Find who is onboarding and notify them
+        for uid, state in list(CLIENT_STATE.items()):
+            if state.get("step") == STEP_CHANNEL:
+                try:
+                    await context.bot.send_message(uid,
+                        "⚠️ I've been added to your channel/group but I don't have *Ban Members* permission.\n\n"
+                        "Please go to admin settings, find me, enable *Ban Members*, then tap *I've added the bot* again.",
+                        parse_mode="Markdown",
+                        reply_markup=_channel_keyboard())
+                except Exception as e:
+                    logging.error(f"Could not notify client {uid}: {e}")
+                break
+        return
+
     for uid, state in list(CLIENT_STATE.items()):
         if state.get("step") == STEP_CHANNEL:
             state["channel_id"]   = chat.id
@@ -751,8 +817,8 @@ async def handle_member_joined(update: Update, context: ContextTypes.DEFAULT_TYP
     if not client or client["channel_id"] != chat_id:
         return
 
-    now   = datetime.now(timezone.utc)
-    delta = timedelta(minutes=5) if pkg.get("is_demo") else timedelta(days=pkg["duration_days"])
+    now    = datetime.now(timezone.utc)
+    delta  = timedelta(minutes=5) if pkg.get("is_demo") else timedelta(days=pkg["duration_days"])
     expiry = now + delta
 
     existing = db.table("members").select("expiry").eq("user_id", user_id).eq("client_id", client_id).execute().data
@@ -795,7 +861,6 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["brand_logo_id"] = None
         state["step"]          = STEP_BANK
         CLIENT_STATE[uid]      = state
-        # Edit caption if photo message, else edit text
         try:
             if query.message.photo:
                 await query.edit_message_caption(
@@ -826,9 +891,6 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send each package in this format:\n`Package Name, Price, Duration in days`\n\n"
             "Examples:\n`1 Month, 5000, 30`\n`3 Months, 12000, 90`"
         )
-        # The flyer prompt was sent as a photo (if FLYER_FILE_ID set) or text.
-        # Either way, send a fresh message — editing a photo caption with no reply_markup
-        # and then continuing is cleaner than trying to detect message type.
         try:
             if query.message.photo:
                 await query.edit_message_caption(caption=pkg_prompt, parse_mode="Markdown")
@@ -868,10 +930,8 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ *Ref Code confirmed:* `{auto_code}`\n"
             f"🔗 *Deep Link:* `{ref_deep_link(auto_code)}`\n\n"
-            "Now let's link your channel/group! 👇\n\n"
-            "1️⃣ Tap *Add me to your channel/group* below\n"
-            "2️⃣ You may see a Telegram error — *ignore it*, I still get added!\n"
-            "3️⃣ Click *I've added the bot* once done.",
+            "Now let's link your channel or group! 👇\n\n"
+            "Tap the button for your channel or group below.",
             parse_mode="Markdown",
             reply_markup=RETRY_KB)
 
@@ -890,8 +950,10 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         found_name = state.get("channel_name")
         if not found_id:
             await context.bot.send_message(uid,
-                "👉 Please forward ANY message from your channel/group to me here so I can detect it.",
-                parse_mode="Markdown")
+                "⚠️ I haven't detected your channel or group yet.\n\n"
+                "Use the buttons below to add me, then tap *I've added the bot* once done.",
+                parse_mode="Markdown",
+                reply_markup=RETRY_KB)
             return
         await context.bot.send_chat_action(uid, "typing")
         try:
@@ -902,10 +964,18 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Please make sure *Admin Rights* is enabled, then try again.",
                     parse_mode="Markdown", reply_markup=RETRY_KB)
                 return
+            if isinstance(bot_member, ChatMemberAdministrator) and not bot_member.can_restrict_members:
+                await context.bot.send_message(uid,
+                    "⚠️ I'm an admin but I don't have *Ban Members* permission.\n\n"
+                    "Please go to admin settings, find me, enable *Ban Members*, then try again.",
+                    parse_mode="Markdown", reply_markup=RETRY_KB)
+                return
         except Exception:
             await context.bot.send_message(uid,
-                "👉 Please forward ANY message from your channel/group to me here so I can detect it.",
-                parse_mode="Markdown")
+                "⚠️ Couldn't verify your channel/group yet.\n\n"
+                "Please use the buttons below to add me, then tap *I've added the bot*.",
+                parse_mode="Markdown",
+                reply_markup=RETRY_KB)
             return
         try:
             await query.edit_message_text(
@@ -1020,7 +1090,9 @@ async def handle_refcode_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
     packages = [p for p in (client.get("packages") or []) if not p.get("is_demo")]
     if not packages:
-        await update.message.reply_text("⚠️ This channel/group has no active packages yet. Contact the admin.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⚠️ This channel/group has no active packages yet. Contact the admin.",
+            parse_mode="Markdown")
         CLIENT_STATE.pop(uid, None)
         return
 
@@ -1181,15 +1253,21 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client_id = rows[0]["client_id"]
 
     if not client_id:
-        await update.message.reply_text("✅ Receipt received! The channel/group admin will review and grant you access.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "✅ Receipt received! The channel/group admin will review and grant you access.",
+            parse_mode="Markdown")
         return
 
     client = get_client(client_id)
     if not client or not is_active_client(client_id):
-        await update.message.reply_text("⚠️ This channel/group's subscription is currently inactive. Please contact the admin.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⚠️ This channel/group's subscription is currently inactive. Please contact the admin.",
+            parse_mode="Markdown")
         return
 
-    await update.message.reply_text("✅ *Receipt received!* 📩\n\nThe admin will review and send your invite link shortly.", parse_mode="Markdown")
+    await update.message.reply_text(
+        "✅ *Receipt received!* 📩\n\nThe admin will review and send your invite link shortly.",
+        parse_mode="Markdown")
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"member_approve:{uid}:{name}:{client_id}"),
         InlineKeyboardButton("❌ Deny",    callback_data=f"member_deny:{uid}:{name}:{client_id}")
@@ -1227,7 +1305,9 @@ async def callback_member_approve(update: Update, context: ContextTypes.DEFAULT_
         f"{p['name']} — {'Free' if p.get('is_demo') else '₦'+p['price']} ({format_duration(p['duration_days'] if not p.get('is_demo') else 0)})",
         callback_data=f"member_pkg:{user_id}:{i}:{client_id}:{name}"
     )] for i, p in enumerate(packages)]
-    await query.edit_message_text(f"📦 Select package for {name}:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(
+        f"📦 Select package for {name}:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1285,7 +1365,8 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown")
 
         await query.edit_message_text(
-            f"✅ *{name}* approved on *{pkg['name']}*. Invite sent! 🎉", parse_mode="Markdown")
+            f"✅ *{name}* approved on *{pkg['name']}*. Invite sent! 🎉",
+            parse_mode="Markdown")
 
         if is_demo:
             await context.bot.send_message(client_id,
@@ -1297,7 +1378,9 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         PENDING_APPROVALS.pop(user_id, None)
-        await query.edit_message_text(f"✅ Saved but couldn't DM {name}:\n`{e}`", parse_mode="Markdown")
+        await query.edit_message_text(
+            f"✅ Saved but couldn't DM {name}:\n`{e}`",
+            parse_mode="Markdown")
 
 
 async def callback_member_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1309,7 +1392,10 @@ async def callback_member_deny(update: Update, context: ContextTypes.DEFAULT_TYP
     client_id = int(parts[3])
     if query.from_user.id != client_id and query.from_user.id not in ADMIN_IDS:
         return
-    ADMIN_STATE[query.from_user.id] = {"action": "member_deny", "user_id": user_id, "username": name, "client_id": client_id}
+    ADMIN_STATE[query.from_user.id] = {
+        "action": "member_deny", "user_id": user_id,
+        "username": name, "client_id": client_id
+    }
     await query.edit_message_text(f"✏️ Type your reason for denying {name}:")
 
 
@@ -1333,7 +1419,8 @@ async def callback_client_approve(update: Update, context: ContextTypes.DEFAULT_
         expiry   = (base if base > now else now) + timedelta(days=30)
         ref_code = existing.get("ref_code") or generate_ref_code(existing.get("brand_name", "SPB"))
         db.table("clients").update({
-            "expiry": expiry.isoformat(), "plan": "paid", "removed": False, "ref_code": ref_code
+            "expiry": expiry.isoformat(), "plan": "paid",
+            "removed": False, "ref_code": ref_code
         }).eq("client_id", client_id).execute()
     else:
         expiry   = now + timedelta(days=30)
@@ -1362,7 +1449,9 @@ async def callback_client_deny(update: Update, context: ContextTypes.DEFAULT_TYP
     parts     = query.data.split(":")
     client_id = int(parts[1])
     name      = parts[2]
-    ADMIN_STATE[query.from_user.id] = {"action": "client_deny", "user_id": client_id, "username": name}
+    ADMIN_STATE[query.from_user.id] = {
+        "action": "client_deny", "user_id": client_id, "username": name
+    }
     await query.edit_message_text(f"✏️ Type your reason for denying {name}:")
 
 
@@ -1420,12 +1509,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in CLIENT_STATE:
         step = state.get("step")
         if step == STEP_CHANNEL:
-            await update.message.reply_text("📌 Please *forward a message* from your channel/group.", parse_mode="Markdown")
+            await update.message.reply_text(
+                "📌 Use the buttons below to add me to your channel or group.\n\n"
+                "For *channels* you can also forward any message from your channel here.",
+                parse_mode="Markdown",
+                reply_markup=_channel_keyboard())
             return
-        if step in [STEP_BRAND, STEP_BANK, STEP_ACCT_NUM, STEP_ACCT_NUM2, STEP_ACCT_NAME, STEP_PACKAGES, STEP_REF_CODE]:
+        if step in [STEP_BRAND, STEP_BANK, STEP_ACCT_NUM, STEP_ACCT_NUM2,
+                    STEP_ACCT_NAME, STEP_PACKAGES, STEP_REF_CODE]:
             await handle_onboarding(update, context, uid)
             return
-        # STEP_FLYER — user sent text when we expect a photo or skip button
         if step == STEP_FLYER:
             await update.message.reply_text(
                 "📸 Please send an *image* for your payment flyer, or tap *Skip* below.",
@@ -1434,7 +1527,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("⏭️ Skip", callback_data="onboard:skip_flyer")
                 ]]))
             return
-        # STEP_BRAND_LOGO — user sent text when we expect a photo or skip button
         if step == STEP_BRAND_LOGO:
             await update.message.reply_text(
                 "📸 Please send an *image* for your brand logo, or tap *Skip* below.",
@@ -1450,7 +1542,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == SETTINGS_EDIT_BRAND:
             db.table("clients").update({"brand_name": text.strip()}).eq("client_id", uid).execute()
             CLIENT_STATE.pop(uid)
-            await update.message.reply_text(f"✅ Brand name updated to: *{text.strip()}*", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"✅ Brand name updated to: *{text.strip()}*", parse_mode="Markdown")
             return
         elif step == SETTINGS_EDIT_BANK:
             db.table("clients").update({"bank_name": text.strip()}).eq("client_id", uid).execute()
@@ -1467,7 +1560,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["account_number_tmp"] = val
             state["step"]               = SETTINGS_EDIT_ACCT_NUM2
             CLIENT_STATE[uid]           = state
-            await update.message.reply_text("🔢 Please *confirm* by entering the account number again:", parse_mode="Markdown")
+            await update.message.reply_text(
+                "🔢 Please *confirm* by entering the account number again:",
+                parse_mode="Markdown")
             return
         elif step == SETTINGS_EDIT_ACCT_NUM2:
             val = text.strip()
@@ -1477,7 +1572,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown")
                 return
             if val != state.get("account_number_tmp"):
-                await update.message.reply_text("⚠️ Numbers don't match. Please enter the account number again:")
+                await update.message.reply_text(
+                    "⚠️ Numbers don't match. Please enter the account number again:")
                 state["step"] = SETTINGS_EDIT_ACCT_NUM
                 CLIENT_STATE[uid] = state
                 return
@@ -1494,13 +1590,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["new_pkg_name"] = text.strip()
             state["step"]         = SETTINGS_ADD_PKG_PRICE
             CLIENT_STATE[uid]     = state
-            await update.message.reply_text("💰 What's the price for this package? _(e.g. 5000)_", parse_mode="Markdown")
+            await update.message.reply_text(
+                "💰 What's the price for this package? _(e.g. 5000)_",
+                parse_mode="Markdown")
             return
         elif step == SETTINGS_ADD_PKG_PRICE:
             state["new_pkg_price"] = text.strip()
             state["step"]          = SETTINGS_ADD_PKG_DUR
             CLIENT_STATE[uid]      = state
-            await update.message.reply_text("📅 How many days does this package last? _(e.g. 30)_", parse_mode="Markdown")
+            await update.message.reply_text(
+                "📅 How many days does this package last? _(e.g. 30)_",
+                parse_mode="Markdown")
             return
         elif step == SETTINGS_ADD_PKG_DUR:
             if not text.strip().isdigit():
@@ -1555,7 +1655,9 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.photo:
         await handle_photo(update, context)
     else:
-        await update.message.reply_text("⚠️ Please only forward messages for channel/group verification.")
+        await update.message.reply_text(
+            "⚠️ Forwarding only works for channel verification.\n\n"
+            "For groups, use the *Add me to your group* button during setup.")
 
 
 # ── /settings ─────────────────────────────────────────────────────────────────
@@ -1630,7 +1732,9 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🏦 Send your new bank name:")
     elif action == "acct_num":
         CLIENT_STATE[uid] = {"step": SETTINGS_EDIT_ACCT_NUM}
-        await query.edit_message_text("💳 Send your new account number: _(must be exactly 10 digits)_", parse_mode="Markdown")
+        await query.edit_message_text(
+            "💳 Send your new account number: _(must be exactly 10 digits)_",
+            parse_mode="Markdown")
     elif action == "acct_name":
         CLIENT_STATE[uid] = {"step": SETTINGS_EDIT_ACCT_NAME}
         await query.edit_message_text("👤 Send your new account name:")
@@ -1647,7 +1751,9 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
     elif action == "add_pkg":
         CLIENT_STATE[uid] = {"step": SETTINGS_ADD_PKG}
-        await query.edit_message_text("📦 What's the name of the new package? _(e.g. 1 Month)_", parse_mode="Markdown")
+        await query.edit_message_text(
+            "📦 What's the name of the new package? _(e.g. 1 Month)_",
+            parse_mode="Markdown")
     elif action == "del_pkg":
         client      = get_client(uid)
         full_pkgs   = client.get("packages") or []
@@ -1659,8 +1765,9 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🗑️ {p['name']} — ₦{p['price']} / {format_duration(p['duration_days'])}",
             callback_data=f"del_pkg:{uid}:{full_pkgs.index(p)}"
         )] for p in custom_pkgs]
-        await query.edit_message_text("Which package do you want to delete? 🗑️",
-                                      reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            "Which package do you want to delete? 🗑️",
+            reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def callback_del_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1729,7 +1836,9 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.unban_chat_member(channel_id, target_id)
     db.table("members").update({"removed": True}).eq("user_id", target_id).eq("client_id", uid).execute()
     PENDING_APPROVALS.pop(target_id, None)
-    await update.message.reply_text(f"✅ `{target_id}` removed from your channel/group.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ `{target_id}` removed from your channel/group.",
+        parse_mode="Markdown")
     if uid not in ADMIN_IDS:
         update_last_seen(uid)
 
