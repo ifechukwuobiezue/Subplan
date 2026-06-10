@@ -1676,20 +1676,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Photo handler ──────────────────────────────────────────────────────────────
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
+    uid = update.effective_user.id
+    
+    # ADMIN BYPASS: If an admin sends a photo, treat it as a file ID request
+    if uid in ADMIN_IDS:
+        await handle_getfileid_media(update, context)
+        return
+
     if await process_channel_verification(update, context, uid):
         return
+        
     state = CLIENT_STATE.get(uid, {})
     step  = state.get("step")
     if step in [STEP_BRAND_LOGO, STEP_FLYER, SETTINGS_EDIT_BRAND_LOGO, SETTINGS_EDIT_FLYER]:
         await handle_onboarding_photo(update, context, uid)
         return
+        
     await handle_receipt(update, context)
 
 
 # ── Forwarded messages ─────────────────────────────────────────────────────────
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    
+    # ADMIN BYPASS: If an admin forwards media to get an ID
+    if uid in ADMIN_IDS and (update.message.photo or update.message.document):
+        await handle_getfileid_media(update, context)
+        return
+
     if await process_channel_verification(update, context, uid):
         return
     if update.message.document:
