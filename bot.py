@@ -1137,9 +1137,7 @@ async def handle_refcode_input(update: Update, context: ContextTypes.DEFAULT_TYP
         CLIENT_STATE.pop(uid, None)
         return
 
-    await send_member_welcome(context.bot, uid, client)
     await _send_member_payment_info(update.message, client)
-
 
 # ── /pay ──────────────────────────────────────────────────────────────────────
 async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1512,7 +1510,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = ADMIN_STATE.pop(uid)
             try:
                 await context.bot.send_message(s["user_id"],
-                    f"❌ *Payment Not Approved*\n\nReason: _{text}_\n\nContact your channel/group admin for help.",
+                    f"❌ *Payment Denied*\n\nReason: _{text}_\n\nContact your channel/group admin for help.",
                     parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Reason sent to {s['username']}.")
             except Exception:
@@ -1522,7 +1520,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = ADMIN_STATE.pop(uid)
             try:
                 await context.bot.send_message(s["user_id"],
-                    f"❌ *Payment Not Approved*\n\nReason: _{text}_\n\nContact @GizmoBrymez for help.",
+                    f"❌ *Payment Denied*\n\nReason: _{text}_\n\nContact @GizmoBrymez for help.",
                     parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Reason sent to {s['username']}.")
             except Exception:
