@@ -361,43 +361,52 @@ async def process_channel_verification(update: Update, context: ContextTypes.DEF
         return False
 
     channel_identifier = None
+    chat_title = None
+
+    # 1. Handling Channels (Forwarding)
+    # Check for forwarded channel messages specifically
     if getattr(update.message, "forward_from_chat", None) and update.message.forward_from_chat.type == "channel":
         channel_identifier = update.message.forward_from_chat.id
+        chat_title = update.message.forward_from_chat.title
     elif getattr(update.message, "forward_origin", None) and getattr(update.message.forward_origin, "chat", None):
         if getattr(update.message.forward_origin.chat, "type", None) == "channel":
             channel_identifier = update.message.forward_origin.chat.id
-
-    if not channel_identifier:
+            chat_title = update.message.forward_origin.chat.title
+        else:
+            # If it's a group forward, redirect to the button-based method
+            await update.message.reply_text(
+                "⚠️ Forwarding is for *channels* only.\n\n"
+                "For *groups*, please use the *Add me to your group* button below.",
+                parse_mode="Markdown",
+                reply_markup=_channel_keyboard())
+            return True
+    else:
+        # If no valid channel forward, prompt for the button-based setup
         await update.message.reply_text(
-            "⚠️ Forwarding only works for channels.\n\n"
-            "For *channels*: forward any message from your channel here.\n"
-            "For *groups*: use the *Add me to your group* button below — I'll detect it automatically once added as admin. 👇",
+            "📌 Use the buttons below to add me to your channel or group.\n\n"
+            "If you are setting up a *channel*, you can also forward any message from it here.",
             parse_mode="Markdown",
             reply_markup=_channel_keyboard())
         return True
 
+    # 2. Verification for detected channel
     await context.bot.send_chat_action(uid, "typing")
     try:
-        chat       = await context.bot.get_chat(channel_identifier)
-        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        bot_member = await context.bot.get_chat_member(channel_identifier, context.bot.id)
         if not isinstance(bot_member, (ChatMemberAdministrator, ChatMemberOwner)):
-            await update.message.reply_text(
-                "⚠️ I found the channel, but I'm not an admin yet. Please add me as an admin and try again.")
+            await update.message.reply_text("⚠️ I'm not an admin in that channel yet. Please add me and try again.")
             return True
         if isinstance(bot_member, ChatMemberAdministrator) and not bot_member.can_restrict_members:
-            await update.message.reply_text(
-                "⚠️ I'm an admin but I don't have *Ban Members* permission.\n\n"
-                "Please go to the channel admin settings, find me, enable *Ban Members*, then try again.",
-                parse_mode="Markdown")
+            await update.message.reply_text("⚠️ I am an admin, but I don't have *Ban Members* permission. Please enable it.")
             return True
-        state["channel_id"]   = chat.id
-        state["channel_name"] = chat.title
-        CLIENT_STATE[uid]     = state
-        await _show_plan_selection(context.bot, uid, chat.title)
+            
+        state["channel_id"] = channel_identifier
+        state["channel_name"] = chat_title
+        CLIENT_STATE[uid] = state
+        await _show_plan_selection(context.bot, uid, chat_title)
     except Exception as e:
         logging.error(f"Channel verification failed: {e}")
-        await update.message.reply_text(
-            "⚠️ I couldn't access that channel. Please try forwarding a message from it.")
+        await update.message.reply_text("⚠️ Verification failed. Please ensure I have admin rights in the channel.")
     return True
 
 
@@ -520,7 +529,7 @@ async def _show_subscription_info(update, context, uid: int, client: dict):
             parse_mode="Markdown")
         return
     await send_member_welcome(context.bot, uid, client)
-    await _send_member_payment_info(update.message, client)
+
 
 
 # ── Callback: welcome ──────────────────────────────────────────────────────────
@@ -1263,7 +1272,8 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not client_id:
         await update.message.reply_text(
-            "✅ Receipt received! The channel/group admin will review and grant you access.",
+            "✅ Receipt received! The Admin will review and grant you access within 2hrs. "
+            "If you don't hear back, contact the admin with your payment details.",
             parse_mode="Markdown")
         return
 
@@ -1274,9 +1284,14 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
+    admin_u = client.get("username", "the admin")
+
     await update.message.reply_text(
-        "✅ *Receipt received!* 📩\n\nThe admin will review and send your invite link shortly.",
+        f"✅ *Receipt received!* 📩\n\n"
+        f"The admin ({admin_u}) will review and send your invite link within 2 hours. "
+        f"If you don't hear back, contact them with your payment details.",
         parse_mode="Markdown")
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"member_approve:{uid}:{name}:{client_id}"),
         InlineKeyboardButton("❌ Deny",    callback_data=f"member_deny:{uid}:{name}:{client_id}")
@@ -1384,7 +1399,6 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         duration_str = "5 minutes after you join" if is_demo else f"{format_duration(pkg['duration_days'])} from when you join"
 
-        await send_member_welcome(context.bot, user_id, client)
         await context.bot.send_message(user_id,
             f"🎉 *Payment Approved!*\n\n"
             f"📦 Package: *{pkg['name']}*\n"
