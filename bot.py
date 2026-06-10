@@ -1137,7 +1137,8 @@ async def handle_refcode_input(update: Update, context: ContextTypes.DEFAULT_TYP
         CLIENT_STATE.pop(uid, None)
         return
 
-    await _send_member_payment_info(update.message, client)
+    await send_member_welcome(context.bot, uid, client)
+
 
 # ── /pay ──────────────────────────────────────────────────────────────────────
 async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
