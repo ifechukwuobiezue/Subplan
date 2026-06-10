@@ -277,23 +277,34 @@ def _kick_expired_clients_sync():
                     logging.error(f"Client kick failed for {c['client_id']}: {e}")
     asyncio.run(_do())
 
-def _remind_members_sync():
+def _remind_members_sync(bot: Bot):
     async def _do():
-        async with Bot(token=BOT_TOKEN) as bot:
-            now = datetime.now(timezone.utc)
-            for days in [3, 1]:
-                start   = (now + timedelta(days=days, hours=-1)).isoformat()
-                end     = (now + timedelta(days=days, hours=1)).isoformat()
-                members = db.table("members").select("user_id, expiry").gte("expiry", start).lte("expiry", end).eq("removed", False).execute().data
-                for m in members:
-                    expiry = datetime.fromisoformat(m["expiry"]).strftime("%b %d, %Y")
-                    try:
-                        await bot.send_message(m["user_id"],
-                            f"⏰ *Heads up!* Your subscription expires in *{days} day{'s' if days > 1 else ''}* ({expiry}).\n\n"
-                            "Renew now via /pay 🙏",
-                            parse_mode="Markdown")
-                    except Exception:
-                        pass
+        now = datetime.now(timezone.utc)
+        # Fetch all active, non-removed members
+        members = db.table("members").select("user_id, username, expiry").eq("removed", False).execute().data
+        
+        for m in members:
+            expiry_dt = datetime.fromisoformat(m["expiry"])
+            days_remaining = (expiry_dt - now).days
+            
+            # Logic: If > 14 days, remind at 7, 3, 1. Else remind at 3, 1.
+            # We check if today is exactly one of those trigger days
+            if days_remaining in [7, 3, 1] and days_remaining > 14:
+                remind_days = [7, 3, 1]
+            elif days_remaining in [3, 1]:
+                remind_days = [3, 1]
+            else:
+                continue
+
+            # Send reminder if match found
+            expiry_str = expiry_dt.strftime("%b %d, %Y")
+            try:
+                await bot.send_message(m["user_id"],
+                    f"⏰ *Heads up!* Your subscription expires in *{days_remaining} day{'s' if days_remaining > 1 else ''}* ({expiry_str}).\n\n"
+                    "Renew now via /pay 🙏",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
     asyncio.run(_do())
 
 def _remind_clients_sync():
@@ -1364,50 +1375,67 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
     await context.bot.send_chat_action(query.from_user.id, "typing")
     client = get_client(client_id)
     pkg    = client["packages"][pkg_idx]
+    now    = datetime.now(timezone.utc)
 
-    PENDING_APPROVALS[user_id] = {
-        "client_id": client_id,
-        "pkg":       pkg,
-        "name":      name
-    }
-
-    now      = datetime.now(timezone.utc)
-    existing = db.table("members").select("user_id").eq("user_id", user_id).eq("client_id", client_id).execute().data
+    # 1. Calculate duration (5 mins for demo, otherwise specified days)
+    delta = timedelta(minutes=5) if pkg.get("is_demo") else timedelta(days=pkg["duration_days"])
+    
+    # 2. Check existing member status in this specific channel
+    existing = db.table("members").select("expiry, removed").eq("user_id", user_id).eq("client_id", client_id).execute().data
+    
+    is_active = False
     if existing:
+        m = existing[0]
+        # They are 'active' if they exist and are not marked as removed
+        is_active = not m["removed"]
+        
+        # Calculate new expiry cumulatively: (current_expiry if > now, else now) + delta
+        base   = datetime.fromisoformat(m["expiry"]) if m.get("expiry") else now
+        expiry = (base if base > now else now) + delta
+        
         db.table("members").update({
-            "package": pkg["name"], "removed": False,
-            "username": name, "expiry": None, "joined_at": None
+            "expiry": expiry.isoformat(), 
+            "package": pkg["name"],
+            "removed": False, 
+            "username": name
         }).eq("user_id", user_id).eq("client_id", client_id).execute()
     else:
+        expiry = now + delta
         db.table("members").insert({
-            "user_id":   user_id,
-            "client_id": client_id,
-            "username":  name,
-            "package":   pkg["name"],
-            "expiry":    None,
-            "joined_at": None,
-            "added_at":  now.isoformat(),
-            "removed":   False
+            "user_id": user_id, 
+            "client_id": client_id, 
+            "username": name,
+            "package": pkg["name"], 
+            "expiry": expiry.isoformat(),
+            "added_at": now.isoformat(), 
+            "removed": False
         }).execute()
 
-    is_demo = pkg.get("is_demo", False)
+    # 3. Decision: Send Invite Link or Success Message
     try:
-        link = (await context.bot.create_chat_invite_link(
-            client["channel_id"], member_limit=1, name=f"user_{user_id}"
-        )).invite_link
+        if is_active:
+            # User is already a member; do not send invite link
+            await context.bot.send_message(user_id,
+                f"🎉 *Subscription Extended!*\n\n"
+                f"Your access for *{pkg['name']}* has been added. "
+                f"New expiry: `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                "You do not need to rejoin. Keep enjoying the content! 🙌",
+                parse_mode="Markdown")
+        else:
+            # User is new or previously removed; send fresh link
+            link = (await context.bot.create_chat_invite_link(
+                client["channel_id"], member_limit=1, name=f"user_{user_id}"
+            )).invite_link
+            await context.bot.send_message(user_id,
+                f"🎉 *Payment Approved!*\n\n"
+                f"Package: *{pkg['name']}*\n"
+                f"Expires: `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                f"👇 Tap below to join:\n{link}",
+                parse_mode="Markdown")
 
-        duration_str = "5 minutes after you join" if is_demo else f"{format_duration(pkg['duration_days'])} from when you join"
-
-        await context.bot.send_message(user_id,
-            f"🎉 *Payment Approved!*\n\n"
-            f"📦 Package: *{pkg['name']}*\n"
-            f"⏳ Your subscription starts the moment you join — valid for *{duration_str}*.\n\n"
-            f"👇 Tap below to join:\n{link}",
-            parse_mode="Markdown")
-
-        await query.edit_message_text(
-            f"✅ *{name}* approved on *{pkg['name']}*. Invite sent! 🎉",
-            parse_mode="Markdown")
+        await query.edit_message_text(f"✅ {name} updated on *{pkg['name']}*.", parse_mode="Markdown")
+    except Exception as e:
+        await query.edit_message_text(f"✅ Processed for {name}, but messaging failed:\n`{e}`", parse_mode="Markdown")
 
         if is_demo:
             await context.bot.send_message(client_id,
