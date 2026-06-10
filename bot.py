@@ -143,6 +143,9 @@ def ref_deep_link(ref_code: str) -> str:
 def format_duration(days: int) -> str:
     if days == 0:
         return "5 mins"
+    if days % 365 == 0:
+        years = days // 365
+        return f"{years} year{'s' if years > 1 else ''}"
     if days % 30 == 0:
         months = days // 30
         return f"{months} month{'s' if months > 1 else ''}"
@@ -157,6 +160,10 @@ def format_expiry_countdown(expiry_iso: str) -> str:
     if delta.total_seconds() <= 0:
         return "Expired"
     total_days = delta.days
+    if total_days >= 365:
+        years = total_days // 365
+        rem   = total_days % 365
+        return f"{years} year{'s' if years > 1 else ''}{', '+str(rem)+' day'+('s' if rem != 1 else '') if rem else ''}"
     if total_days >= 30:
         months = total_days // 30
         days   = total_days % 30
@@ -199,6 +206,26 @@ async def send_member_welcome(bot, user_id: int, client: dict):
         except Exception:
             pass
     await bot.send_message(user_id, text, parse_mode="Markdown")
+
+async def _send_member_payment_info(message, client: dict):
+    """Send clean payment details to a member — mirrors the old single-client bot format."""
+    admin_u   = client.get("username", "the admin")
+    packages  = [p for p in (client.get("packages") or []) if not p.get("is_demo")]
+    pkg_lines = "\n".join([f"• *{p['name']}* — ₦{p['price']} ({format_duration(p['duration_days'])})" for p in packages])
+
+    caption = (
+        f"💳 *Payment Details — {client['brand_name']}*\n\n"
+        f"📦 *Packages:*\n{pkg_lines}\n\n"
+        f"🏦 Bank: {client['bank_name']}\n"
+        f"💰 Account Number: `{client['account_number']}`\n"
+        f"👤 Account Name: {client['account_name']}\n\n"
+        "After payment kindly send your receipt here.\n\n"
+        f"_For non-Nigerians, kindly DM {admin_u} for a different payment method._"
+    )
+    if client.get("flyer_file_id"):
+        await message.reply_photo(photo=client["flyer_file_id"], caption=caption, parse_mode="Markdown")
+    else:
+        await message.reply_text(caption, parse_mode="Markdown")
 
 
 # ── Cron helpers ───────────────────────────────────────────────────────────────
@@ -333,7 +360,6 @@ async def process_channel_verification(update: Update, context: ContextTypes.DEF
     if state.get("step") != STEP_CHANNEL:
         return False
 
-    # Only attempt forwarding for channels — groups block forward metadata
     channel_identifier = None
     if getattr(update.message, "forward_from_chat", None) and update.message.forward_from_chat.type == "channel":
         channel_identifier = update.message.forward_from_chat.id
@@ -378,7 +404,7 @@ async def process_channel_verification(update: Update, context: ContextTypes.DEF
 async def _show_plan_selection(bot, uid: int, channel_name: str):
     caption = (
         "🚀 *SubPlanBot Plans*\n\n"
-        "🧪 *Test Environment* — 24 hrs, test with another Telegram account\n"
+        "🧪 *24hrs Test Environment* — test by inviting a secondary account to your channel or group using your invite link.\n"
         f"💳 *Monthly Plan* — ₦{PLATFORM_PRICE}/month\n\n"
         "_Use the Test Environment to see exactly how your members' experience looks before going live!_\n\n"
         "Choose an option below 👇"
@@ -418,7 +444,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state["channel_name"] = chat.title
                 CLIENT_STATE[uid]     = state
                 await _show_plan_selection(context.bot, uid, chat.title)
-            except Exception as e:logging.error(f"Group start detection failed: {e}")
+            except Exception as e:
+                logging.error(f"Group start detection failed: {e}")
         return
 
     await context.bot.send_chat_action(uid, "typing")
@@ -445,27 +472,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 *Welcome back, {client.get('brand_name', 'there')}!*\n\n"
             "📋 /list — view your active members\n"
-            "❌ /remove [id] — remove a member\n"
+            "❌ /remove — remove a member\n"
             "⚙️ /settings — manage brand, packages & payment info\n"
             "💳 /pay — renew your SubPlanBot subscription\n\n"
             f"🔑 *Your Ref Code:* `{ref}`\n"
             f"🔗 *Deep Link:* `{ref_deep_link(ref)}`\n"
-            "_Share either with your members so they can subscribe instantly._",
+            "_Share either with your members so they can subscribe instantly._\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez",
             parse_mode="Markdown")
         return
 
     if is_client(uid):
         await update.message.reply_text(
             "⚠️ *Your SubPlanBot subscription has expired.*\n\n"
-            "Use /pay to renew and restore your channel/group management.",
+            "Use /pay to renew and restore your channel/group management.\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez",
             parse_mode="Markdown")
         return
 
     welcome_text = (
         "🚀 *Welcome to SubPlan Bot!*\n\n"
-        "You're one step away from turning your Telegram channel or group into a *money-making machine* 💰\n\n"
-        "Sell access, collect payments, and automatically remove expired subscribers — "
-        "no code, no stress, just growth. 📈\n\n"
+        "The easiest way to run paid Telegram channels & groups.\n\n"
+        "It handles payments, provides paid access, and automatically tracks and removes expired subscriptions — "
+        "You focus on growing your community📈\n\n"
         "What are you here for? 👇"
     )
     keyboard = InlineKeyboardMarkup([
@@ -490,19 +519,8 @@ async def _show_subscription_info(update, context, uid: int, client: dict):
             "⚠️ This channel/group has no active packages yet. Contact the admin.",
             parse_mode="Markdown")
         return
-    pkg_lines = "\n".join([f"• *{p['name']}* — ₦{p['price']} ({format_duration(p['duration_days'])})" for p in packages])
-    caption   = (
-        f"🎉 *{client['brand_name']}* — Subscribe\n\n"
-        f"Available packages:\n{pkg_lines}\n\n"
-        f"🏦 Bank: {client['bank_name']}\n"
-        f"💳 Account Number: `{client['account_number']}`\n"
-        f"👤 Account Name: {client['account_name']}\n\n"
-        "📸 Make payment and send your *receipt (screenshot/PDF)* here."
-    )
-    if client.get("flyer_file_id"):
-        await update.message.reply_photo(photo=client["flyer_file_id"], caption=caption, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(caption, parse_mode="Markdown")
+    await send_member_welcome(context.bot, uid, client)
+    await _send_member_payment_info(update.message, client)
 
 
 # ── Callback: welcome ──────────────────────────────────────────────────────────
@@ -526,7 +544,8 @@ async def callback_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚙️ /settings — manage brand, packages & payment info\n"
                 "💳 /pay — renew your SubPlanBot subscription\n\n"
                 f"🔑 *Your Ref Code:* `{ref}`\n"
-                f"🔗 *Deep Link:* `{ref_deep_link(ref)}`"
+                f"🔗 *Deep Link:* `{ref_deep_link(ref)}`\n\n"
+                "❓ Got questions? Reach out to @GizmoBrymez"
             )
             if query.message.photo:
                 await query.edit_message_caption(caption=msg, parse_mode="Markdown")
@@ -535,7 +554,11 @@ async def callback_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if is_client(uid):
-            msg = "⚠️ *Your SubPlanBot subscription has expired.*\n\nUse /pay to renew."
+            msg = (
+                "⚠️ *Your SubPlanBot subscription has expired.*\n\n"
+                "Use /pay to renew.\n\n"
+                "❓ Got questions? Reach out to @GizmoBrymez"
+            )
             if query.message.photo:
                 await query.edit_message_caption(caption=msg, parse_mode="Markdown")
             else:
@@ -544,8 +567,8 @@ async def callback_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         CLIENT_STATE[uid] = {"step": STEP_BRAND}
         onboard_text = (
-            "🏢 *Great! Let's get your channel/group set up.*\n\n"
-            "It only takes a couple of minutes and everything will be fully automated. 🚀\n\n"
+            "😌 *Great! Let's get your channel/group set up.*\n\n"
+            "You can change anything later using /settings ⚙️\n\n"
             "First — what's your *brand name*?\n"
             "_(e.g. TechSignals Pro, MoneyMoves Hub)_"
         )
@@ -559,7 +582,7 @@ async def callback_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sub_text = (
             "🎟️ *Subscribe to a Channel/Group*\n\n"
             "Please enter the *Ref Code* shared by your channel/group admin.\n\n"
-            "It looks something like: `TECH-X7K2`\n\n"
+            "It looks something like: `TECH or TECH-X7K2`\n\n"
             "👉 Type or paste it below:"
         )
         if query.message.photo:
@@ -592,7 +615,7 @@ async def handle_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         state["step"]      = STEP_ACCT_NUM
         CLIENT_STATE[uid]  = state
         await update.message.reply_text(
-            "🔢 What's your *account number*? _(must be exactly 10 digits)_",
+            "🔢 What's your *account number*?",
             parse_mode="Markdown")
 
     elif step == STEP_ACCT_NUM:
@@ -728,8 +751,13 @@ async def handle_onboarding_photo(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(
             "✅ *Flyer saved!*\n\n"
             "📦 Now let's set up your *subscription packages*.\n\n"
-            "Send each package in this format:\n`Package Name, Price, Duration in days`\n\n"
-            "Examples:\n`1 Month, 5000, 30`\n`3 Months, 12000, 90`",
+            "Send each package one after the other in this format:\n"
+            "`Package Name, Price, Duration in days`\n\n"
+            "We'll automatically convert the duration into months or years where needed — just send it in days.\n\n"
+            "Examples:\n"
+            "`1 Month, 5000, 30`\n"
+            "`Diamond Plan, 12000, 90`\n\n"
+            "Enter your first package below 👇",
             parse_mode="Markdown")
 
     elif step == SETTINGS_EDIT_BRAND_LOGO:
@@ -762,9 +790,7 @@ async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not isinstance(new_status, (ChatMemberAdministrator, ChatMemberOwner)):
         return
 
-    # Check ban rights
     if isinstance(new_status, ChatMemberAdministrator) and not new_status.can_restrict_members:
-        # Find who is onboarding and notify them
         for uid, state in list(CLIENT_STATE.items()):
             if state.get("step") == STEP_CHANNEL:
                 try:
@@ -888,8 +914,13 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pkg_prompt = (
             "👍 No flyer — that's fine!\n\n"
             "📦 Now let's set up your *subscription packages*.\n\n"
-            "Send each package in this format:\n`Package Name, Price, Duration in days`\n\n"
-            "Examples:\n`1 Month, 5000, 30`\n`3 Months, 12000, 90`"
+            "Send each package one after the other in this format:\n"
+            "`Package Name, Price, Duration in days`\n\n"
+            "We'll automatically convert the duration into months or years where needed — just send it in days.\n\n"
+            "Examples:\n"
+            "`1 Month, 5000, 30`\n"
+            "`Diamond Plan, 12000, 90`\n\n"
+            "Enter your first package below 👇"
         )
         try:
             if query.message.photo:
@@ -1018,10 +1049,11 @@ async def callback_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💳 *Payment Details — SubPlanBot*\n\n"
             f"💰 Amount: ₦{PLATFORM_PRICE}/month\n\n"
             f"🏦 Bank: {PLATFORM_BANK_NAME}\n"
-            f"💳 Account Number: `{PLATFORM_ACCT_NUMBER}`\n"
+            f"💰 Account Number: `{PLATFORM_ACCT_NUMBER}`\n"
             f"👤 Account Name: {PLATFORM_ACCT_NAME}\n\n"
             "📸 Make payment and send your receipt here.\n"
-            "Our team will activate your account shortly ✅"
+            "Our team will activate your account shortly ✅\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez"
         )
         state["awaiting_payment"] = True
         CLIENT_STATE[uid] = state
@@ -1096,19 +1128,8 @@ async def handle_refcode_input(update: Update, context: ContextTypes.DEFAULT_TYP
         CLIENT_STATE.pop(uid, None)
         return
 
-    pkg_lines = "\n".join([f"• *{p['name']}* — ₦{p['price']} ({format_duration(p['duration_days'])})" for p in packages])
-    caption   = (
-        f"🎉 *{client['brand_name']}* — Subscribe\n\n"
-        f"Available packages:\n{pkg_lines}\n\n"
-        f"🏦 Bank: {client['bank_name']}\n"
-        f"💳 Account Number: `{client['account_number']}`\n"
-        f"👤 Account Name: {client['account_name']}\n\n"
-        "📸 Make payment and send your *receipt (screenshot/PDF)* here."
-    )
-    if client.get("flyer_file_id"):
-        await update.message.reply_photo(photo=client["flyer_file_id"], caption=caption, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(caption, parse_mode="Markdown")
+    await send_member_welcome(context.bot, uid, client)
+    await _send_member_payment_info(update.message, client)
 
 
 # ── /pay ──────────────────────────────────────────────────────────────────────
@@ -1126,10 +1147,11 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💳 *Renew Your SubPlanBot Subscription*\n\n"
             f"💰 Amount: ₦{PLATFORM_PRICE}/month\n\n"
             f"🏦 Bank: {PLATFORM_BANK_NAME}\n"
-            f"💳 Account Number: `{PLATFORM_ACCT_NUMBER}`\n"
+            f"💰 Account Number: `{PLATFORM_ACCT_NUMBER}`\n"
             f"👤 Account Name: {PLATFORM_ACCT_NAME}\n\n"
             "📸 Make payment and send your receipt here.\n"
-            "Our team will extend your subscription once confirmed ✅"
+            "Our team will extend your subscription once confirmed ✅\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez"
         )
         await update.message.reply_text(caption, parse_mode="Markdown")
         return
@@ -1153,20 +1175,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Couldn't find payment details. Contact your admin.")
         return
 
-    packages  = [p for p in (client.get("packages") or []) if not p.get("is_demo")]
-    pkg_lines = "\n".join([f"• *{p['name']}* — ₦{p['price']} ({format_duration(p['duration_days'])})" for p in packages])
-    caption   = (
-        f"💳 *Payment Details — {client['brand_name']}*\n\n"
-        f"📦 Packages:\n{pkg_lines}\n\n"
-        f"🏦 Bank: {client['bank_name']}\n"
-        f"💳 Account Number: `{client['account_number']}`\n"
-        f"👤 Account Name: {client['account_name']}\n\n"
-        "📸 Send your receipt here after payment ✅"
-    )
-    if client.get("flyer_file_id"):
-        await update.message.reply_photo(photo=client["flyer_file_id"], caption=caption, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(caption, parse_mode="Markdown")
+    await _send_member_payment_info(update.message, client)
 
 
 # ── /renew ─────────────────────────────────────────────────────────────────────
@@ -1301,13 +1310,32 @@ async def callback_member_approve(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⚠️ No packages set up. Use /settings to add packages.")
         return
 
-    keyboard = [[InlineKeyboardButton(
-        f"{p['name']} — {'Free' if p.get('is_demo') else '₦'+p['price']} ({format_duration(p['duration_days'] if not p.get('is_demo') else 0)})",
-        callback_data=f"member_pkg:{user_id}:{i}:{client_id}:{name}"
-    )] for i, p in enumerate(packages)]
+    is_test  = client.get("plan") == "test"
+    keyboard = []
+    for i, p in enumerate(packages):
+        is_demo = p.get("is_demo", False)
+        label   = f"{p['name']} — {'Free' if is_demo else '₦'+p['price']} ({format_duration(p['duration_days'] if not is_demo else 0)})"
+        if is_test and not is_demo:
+            keyboard.append([InlineKeyboardButton(
+                f"🔒 {label} (test mode only)",
+                callback_data=f"noop:{i}"
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                label,
+                callback_data=f"member_pkg:{user_id}:{i}:{client_id}:{name}"
+            )])
+
     await query.edit_message_text(
-        f"📦 Select package for {name}:",
+        f"📦 Select package for {name}:"
+        + ("\n\n_🔒 Custom packages are disabled during the Test Environment._" if is_test else ""),
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def callback_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(
+        "🔒 This package is disabled during the Test Environment.", show_alert=True)
 
 
 async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1434,7 +1462,7 @@ async def callback_client_approve(update: Update, context: ContextTypes.DEFAULT_
         f"🔑 *Your Ref Code:* `{ref_code}`\n"
         f"🔗 *Deep Link:* `{ref_deep_link(ref_code)}`\n"
         "_Share these with your members so they can subscribe instantly._\n\n"
-        "With love ❤️ — SubPlanBot",
+        "❓ Got questions? Reach out to @GizmoBrymez",
         parse_mode="Markdown")
     await query.edit_message_text(
         f"✅ {name} approved. Subscription active until {expiry.strftime('%b %d, %Y')}.",
@@ -1480,7 +1508,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = ADMIN_STATE.pop(uid)
             try:
                 await context.bot.send_message(s["user_id"],
-                    f"❌ *Payment Not Approved*\n\nReason: _{text}_\n\nContact @SubPlanBotSupport for help.",
+                    f"❌ *Payment Not Approved*\n\nReason: _{text}_\n\nContact @GizmoBrymez for help.",
                     parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Reason sent to {s['username']}.")
             except Exception:
@@ -1622,7 +1650,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_client(uid) and not is_active_client(uid):
         await update.message.reply_text(
-            "⚠️ *Your SubPlanBot subscription has expired.*\n\nUse /pay to renew.",
+            "⚠️ *Your SubPlanBot subscription has expired.*\n\nUse /pay to renew.\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez",
             parse_mode="Markdown")
         return
 
@@ -1916,6 +1945,7 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(callback_client_deny,    pattern=r"^client_deny:"))
     app.add_handler(CallbackQueryHandler(callback_settings,       pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(callback_del_pkg,        pattern=r"^del_pkg:"))
+    app.add_handler(CallbackQueryHandler(callback_noop,           pattern=r"^noop:"))
 
     print("🤖 SubPlanBot polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
