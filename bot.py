@@ -1213,30 +1213,44 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await context.bot.send_chat_action(uid, "typing")
 
-    rows = db.table("members").select("client_id, package, expiry, removed").eq("user_id", uid).eq("removed", False).execute().data
-    if not rows:
+    # 1. Check if user is a Client
+    client = get_client(uid)
+    if client and not client.get("removed", False):
+        expiry_dt = datetime.fromisoformat(client["expiry"])
+        status    = "✅ Active" if expiry_dt > datetime.now(timezone.utc) else "❌ Expired"
+        countdown = format_expiry_countdown(client["expiry"])
+        
         await update.message.reply_text(
-            "ℹ️ You don't have an active subscription yet.\n\n"
-            "Use /start to subscribe to a channel/group.",
+            f"👑 *Your Subscription Status*\n\n"
+            f"🔰 Status: {status}\n"
+            f"📅 Expires: {expiry_dt.strftime('%b %d, %Y')}\n"
+            f"⏳ Time left: {countdown}\n"
+            f"🔑 Ref Code: `{client.get('ref_code', 'N/A')}`",
             parse_mode="Markdown")
+        return
+
+    # 2. Check if user is a Member
+    rows = db.table("members").select("client_id, package, expiry").eq("user_id", uid).eq("removed", False).execute().data
+    
+    if not rows:
+        await update.message.reply_text("ℹ️ You don't have an active subscription.", parse_mode="Markdown")
         return
 
     lines = ["📊 *Your Subscription Status*\n"]
     for row in rows:
-        client    = get_client(row["client_id"])
-        brand     = client["brand_name"] if client else "Unknown"
-        if not row["expiry"]:
-            lines.append(
-                f"📢 *{brand}*\n"
-                f"📦 Plan: {row.get('package', 'N/A')}\n"
-                f"🔰 Status: ⏳ Pending (join the channel/group to activate)\n"
-            )
-            continue
-        expiry_dt  = datetime.fromisoformat(row["expiry"])
-        is_active  = expiry_dt > datetime.now(timezone.utc)
-        status     = "✅ Active" if is_active else "❌ Expired"
-        countdown  = format_expiry_countdown(row["expiry"])
-        expiry_str = expiry_dt.strftime("%b %d, %Y at %H:%M UTC")
+        c_info = get_client(row["client_id"])
+        brand  = c_info["brand_name"] if c_info else "Unknown"
+        
+        expiry_dt = datetime.fromisoformat(row["expiry"]) if row.get("expiry") else None
+        if not expiry_dt:
+            status = "⏳ Pending"
+            expiry_str = "N/A"
+            countdown = "N/A"
+        else:
+            status = "✅ Active" if expiry_dt > datetime.now(timezone.utc) else "❌ Expired"
+            expiry_str = expiry_dt.strftime("%b %d, %Y")
+            countdown = format_expiry_countdown(row["expiry"])
+            
         lines.append(
             f"📢 *{brand}*\n"
             f"📦 Plan: {row.get('package', 'N/A')}\n"
@@ -1377,65 +1391,59 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
     pkg    = client["packages"][pkg_idx]
     now    = datetime.now(timezone.utc)
 
-    # 1. Calculate duration (5 mins for demo, otherwise specified days)
+    # 1. Delta: Only the new time being added
     delta = timedelta(minutes=5) if pkg.get("is_demo") else timedelta(days=pkg["duration_days"])
     
-    # 2. Check existing member status in this specific channel
+    # 2. Check existing record
     existing = db.table("members").select("expiry, removed").eq("user_id", user_id).eq("client_id", client_id).execute().data
     
-    is_active = False
     if existing:
         m = existing[0]
-        # They are 'active' if they exist and are not marked as removed
-        is_active = not m["removed"]
-        
-        # Calculate new expiry cumulatively: (current_expiry if > now, else now) + delta
+        # Cumulative Math: Extension logic
         base   = datetime.fromisoformat(m["expiry"]) if m.get("expiry") else now
         expiry = (base if base > now else now) + delta
         
+        # EXTEND ONLY: Only update the expiry and removed status. 
+        # We leave 'package' and 'username' alone to avoid overwriting or syncing old state.
         db.table("members").update({
-            "expiry": expiry.isoformat(), 
-            "package": pkg["name"],
-            "removed": False, 
-            "username": name
+            "expiry": expiry.isoformat(),
+            "removed": False
         }).eq("user_id", user_id).eq("client_id", client_id).execute()
+        
+        is_active = not m["removed"]
     else:
+        # New record creation
         expiry = now + delta
         db.table("members").insert({
-            "user_id": user_id, 
-            "client_id": client_id, 
-            "username": name,
-            "package": pkg["name"], 
-            "expiry": expiry.isoformat(),
-            "added_at": now.isoformat(), 
-            "removed": False
+            "user_id": user_id, "client_id": client_id, "username": name,
+            "package": pkg["name"], "expiry": expiry.isoformat(),
+            "added_at": now.isoformat(), "removed": False
         }).execute()
+        is_active = False
 
-    # 3. Decision: Send Invite Link or Success Message
+    # 3. Notification
     try:
         if is_active:
-            # User is already a member; do not send invite link
             await context.bot.send_message(user_id,
                 f"🎉 *Subscription Extended!*\n\n"
-                f"Your access for *{pkg['name']}* has been added. "
+                f"Your subscription has been successfully extended.\n"
                 f"New expiry: `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
-                "You do not need to rejoin. Keep enjoying the content! 🙌",
+                "Keep enjoying the content! 🙌",
                 parse_mode="Markdown")
         else:
-            # User is new or previously removed; send fresh link
             link = (await context.bot.create_chat_invite_link(
                 client["channel_id"], member_limit=1, name=f"user_{user_id}"
             )).invite_link
             await context.bot.send_message(user_id,
                 f"🎉 *Payment Approved!*\n\n"
-                f"Package: *{pkg['name']}*\n"
-                f"Expires: `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                f"Your subscription is active until `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
                 f"👇 Tap below to join:\n{link}",
                 parse_mode="Markdown")
 
-        await query.edit_message_text(f"✅ {name} updated on *{pkg['name']}*.", parse_mode="Markdown")
+        await query.edit_message_text(f"✅ {name} extended successfully.", parse_mode="Markdown")
     except Exception as e:
         await query.edit_message_text(f"✅ Processed for {name}, but messaging failed:\n`{e}`", parse_mode="Markdown")
+
 
         if is_demo:
             await context.bot.send_message(client_id,
