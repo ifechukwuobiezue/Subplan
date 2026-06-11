@@ -430,11 +430,12 @@ async def _show_plan_selection(bot, uid: int, channel_name: str):
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
+# ── /start ─────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     chat = update.effective_chat
     
-    # 1. THE GUARD: Handle all existing/expired clients first
+    # 1. THE CLIENT GUARD: Stop clients from entering onboarding
     if is_client(uid):
         if is_active_client(uid):
             update_last_seen(uid)
@@ -444,9 +445,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👋 *Welcome back, {client.get('brand_name', 'there')}!*\n\n"
                 "📋 /list — view active members\n"
                 "❌ /remove — remove a member\n"
-                "⚙️ /settings — manage account\n"
-                "💳 /pay — renew your subscription\n\n"
-                f"🔑 *Ref Code:* `{ref}`\n"
+                "⚙️ /settings — manage brand, packages & payment info\n"
+                "💳 /pay — renew your SubPlanBot subscription\n\n"
+                f"🔑 *Your Ref Code:* `{ref}`\n"
+                f"🔗 *Deep Link:* `{ref_deep_link(ref)}`\n"
+                "_Share either with your members so they can subscribe instantly._\n\n"
                 "❓ Got questions? Reach out to @GizmoBrymez",
                 parse_mode="Markdown")
         else:
@@ -457,17 +460,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
-    # 2. GROUP/SUPERGROUP SETUP
+    # 2. ORIGINAL ONBOARDING LOGIC (Preserved exactly as you had it)
+    user = update.effective_user
+    chat = update.effective_chat
+
     if chat.type in ("group", "supergroup"):
         state = CLIENT_STATE.get(uid, {})
         if state.get("step") == STEP_CHANNEL:
             try:
                 bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
                 if not isinstance(bot_member, (ChatMemberAdministrator, ChatMemberOwner)):
-                    await update.message.reply_text("⚠️ I need to be an admin with *Ban Users* enabled.", parse_mode="Markdown")
+                    await update.message.reply_text("⚠️ I'm here but I need to be an admin with *Ban Users* enabled first.", parse_mode="Markdown")
                     return
                 if isinstance(bot_member, ChatMemberAdministrator) and not bot_member.can_restrict_members:
-                    await update.message.reply_text("⚠️ *Ban Users* permission is off. Please enable it and run /start again.", parse_mode="Markdown")
+                    await update.message.reply_text("⚠️ I'm an admin but *Ban Users* is off. Please enable it and run /start again.", parse_mode="Markdown")
                     return
                 state["channel_id"]   = chat.id
                 state["channel_name"] = chat.title
@@ -477,7 +483,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Group start detection failed: {e}")
         return
 
-    # 3. NEW USER FLOW
     await context.bot.send_chat_action(uid, "typing")
 
     if context.args:
@@ -488,10 +493,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if uid in ADMIN_IDS:
-        await update.message.reply_text("👾 *SubPlan Bot Admin Panel*", parse_mode="Markdown")
+        await update.message.reply_text("👾 *SubPlan Bot Super Admin Panel*\n\n/clientlist — view all active clients\n/getfileid — get file ID", parse_mode="Markdown")
         return
 
-    welcome_text = "🚀 *Welcome to SubPlan Bot!*\n\nWhat are you here for? 👇"
+    welcome_text = (
+        "🚀 *Welcome to SubPlan Bot!*\n\n"
+        "The easiest way to run paid Telegram channels & groups.\n\n"
+        "It handles payments, provides paid access, and automatically tracks and removes expired subscriptions — "
+        "You focus on growing your community📈\n\n"
+        "What are you here for? 👇"
+    )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏢 I'm a Channel/Group Admin", callback_data="welcome:admin")],
         [InlineKeyboardButton("🎟️ Subscribe to a Channel/Group", callback_data="welcome:subscribe")]
@@ -1133,7 +1144,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👑 You're a platform admin. No payment needed!")
         return
 
-    # PRIORITIZE CLIENT RENEWAL
+    # NEW: CLIENT RENEWAL PATH (High priority guard)
     if is_client(uid):
         update_last_seen(uid)
         caption = (
@@ -1143,20 +1154,25 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Account Number: `{PLATFORM_ACCT_NUMBER}`\n"
             f"👤 Account Name: {PLATFORM_ACCT_NAME}\n\n"
             "📸 Make payment and send your receipt here.\n"
-            "Our team will extend your subscription once confirmed ✅"
+            "Our team will extend your subscription once confirmed ✅\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez"
         )
         await update.message.reply_text(caption, parse_mode="Markdown")
         return
 
-    # EXISTING MEMBER PAYMENT FLOW
+    # MEMBER PAYMENT PATH (Only reachable if user is NOT a client)
     state     = CLIENT_STATE.get(uid, {})
     client_id = state.get("subscribing_to_client_id")
     if not client_id:
         rows = db.table("members").select("client_id").eq("user_id", uid).eq("removed", False).execute().data
-        if rows: client_id = rows[0]["client_id"]
+        if rows:
+            client_id = rows[0]["client_id"]
 
     if not client_id:
-        await update.message.reply_text("⚠️ You're not linked to a channel/group yet. Use /start.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⚠️ You're not linked to a channel/group yet.\n\n"
+            "Use /start and select *Subscribe to a Channel/Group* to get started.",
+            parse_mode="Markdown")
         return
 
     client = get_client(client_id)
