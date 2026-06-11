@@ -431,24 +431,43 @@ async def _show_plan_selection(bot, uid: int, channel_name: str):
 
 # ── /start ─────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uid  = user.id
+    uid  = update.effective_user.id
     chat = update.effective_chat
+    
+    # 1. THE GUARD: Handle all existing/expired clients first
+    if is_client(uid):
+        if is_active_client(uid):
+            update_last_seen(uid)
+            client = get_client(uid)
+            ref    = client.get("ref_code", "N/A")
+            await update.message.reply_text(
+                f"👋 *Welcome back, {client.get('brand_name', 'there')}!*\n\n"
+                "📋 /list — view active members\n"
+                "❌ /remove — remove a member\n"
+                "⚙️ /settings — manage account\n"
+                "💳 /pay — renew your subscription\n\n"
+                f"🔑 *Ref Code:* `{ref}`\n"
+                "❓ Got questions? Reach out to @GizmoBrymez",
+                parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "⚠️ *Your SubPlanBot subscription has expired.*\n\n"
+                "Use /pay to renew and restore your channel/group management.\n\n"
+                "❓ Got questions? Reach out to @GizmoBrymez",
+                parse_mode="Markdown")
+        return
 
+    # 2. GROUP/SUPERGROUP SETUP
     if chat.type in ("group", "supergroup"):
         state = CLIENT_STATE.get(uid, {})
         if state.get("step") == STEP_CHANNEL:
             try:
                 bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
                 if not isinstance(bot_member, (ChatMemberAdministrator, ChatMemberOwner)):
-                    await update.message.reply_text(
-                        "⚠️ I'm here but I need to be an admin with *Ban Users* enabled first.",
-                        parse_mode="Markdown")
+                    await update.message.reply_text("⚠️ I need to be an admin with *Ban Users* enabled.", parse_mode="Markdown")
                     return
                 if isinstance(bot_member, ChatMemberAdministrator) and not bot_member.can_restrict_members:
-                    await update.message.reply_text(
-                        "⚠️ I'm an admin but *Ban Users* is off. Please enable it and run /start again.",
-                        parse_mode="Markdown")
+                    await update.message.reply_text("⚠️ *Ban Users* permission is off. Please enable it and run /start again.", parse_mode="Markdown")
                     return
                 state["channel_id"]   = chat.id
                 state["channel_name"] = chat.title
@@ -458,6 +477,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Group start detection failed: {e}")
         return
 
+    # 3. NEW USER FLOW
     await context.bot.send_chat_action(uid, "typing")
 
     if context.args:
@@ -468,56 +488,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if uid in ADMIN_IDS:
-        await update.message.reply_text(
-            "👾 *SubPlan Bot Super Admin Panel*\n\n"
-            "/clientlist — view all active clients\n"
-            "/getfileid — get file ID",
-            parse_mode="Markdown")
+        await update.message.reply_text("👾 *SubPlan Bot Admin Panel*", parse_mode="Markdown")
         return
 
-    if is_active_client(uid):
-        update_last_seen(uid)
-        client = get_client(uid)
-        ref    = client.get("ref_code", "N/A")
-        await update.message.reply_text(
-            f"👋 *Welcome back, {client.get('brand_name', 'there')}!*\n\n"
-            "📋 /list — view your active members\n"
-            "❌ /remove — remove a member\n"
-            "⚙️ /settings — manage brand, packages & payment info\n"
-            "💳 /pay — renew your SubPlanBot subscription\n\n"
-            f"🔑 *Your Ref Code:* `{ref}`\n"
-            f"🔗 *Deep Link:* `{ref_deep_link(ref)}`\n"
-            "_Share either with your members so they can subscribe instantly._\n\n"
-            "❓ Got questions? Reach out to @GizmoBrymez",
-            parse_mode="Markdown")
-        return
-
-    if is_client(uid):
-        await update.message.reply_text(
-            "⚠️ *Your SubPlanBot subscription has expired.*\n\n"
-            "Use /pay to renew and restore your channel/group management.\n\n"
-            "❓ Got questions? Reach out to @GizmoBrymez",
-            parse_mode="Markdown")
-        return
-
-    welcome_text = (
-        "🚀 *Welcome to SubPlan Bot!*\n\n"
-        "The easiest way to run paid Telegram channels & groups.\n\n"
-        "It handles payments, provides paid access, and automatically tracks and removes expired subscriptions — "
-        "You focus on growing your community📈\n\n"
-        "What are you here for? 👇"
-    )
+    welcome_text = "🚀 *Welcome to SubPlan Bot!*\n\nWhat are you here for? 👇"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏢 I'm a Channel/Group Admin", callback_data="welcome:admin")],
         [InlineKeyboardButton("🎟️ Subscribe to a Channel/Group", callback_data="welcome:subscribe")]
     ])
     if WELCOME_FILE_ID:
         try:
-            await update.message.reply_photo(photo=WELCOME_FILE_ID, caption=welcome_text,
-                                             parse_mode="Markdown", reply_markup=keyboard)
+            await update.message.reply_photo(photo=WELCOME_FILE_ID, caption=welcome_text, parse_mode="Markdown", reply_markup=keyboard)
             return
-        except Exception:
-            pass
+        except Exception: pass
     await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -1150,6 +1133,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👑 You're a platform admin. No payment needed!")
         return
 
+    # PRIORITIZE CLIENT RENEWAL
     if is_client(uid):
         update_last_seen(uid)
         caption = (
@@ -1159,24 +1143,20 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Account Number: `{PLATFORM_ACCT_NUMBER}`\n"
             f"👤 Account Name: {PLATFORM_ACCT_NAME}\n\n"
             "📸 Make payment and send your receipt here.\n"
-            "Our team will extend your subscription once confirmed ✅\n\n"
-            "❓ Got questions? Reach out to @GizmoBrymez"
+            "Our team will extend your subscription once confirmed ✅"
         )
         await update.message.reply_text(caption, parse_mode="Markdown")
         return
 
+    # EXISTING MEMBER PAYMENT FLOW
     state     = CLIENT_STATE.get(uid, {})
     client_id = state.get("subscribing_to_client_id")
     if not client_id:
         rows = db.table("members").select("client_id").eq("user_id", uid).eq("removed", False).execute().data
-        if rows:
-            client_id = rows[0]["client_id"]
+        if rows: client_id = rows[0]["client_id"]
 
     if not client_id:
-        await update.message.reply_text(
-            "⚠️ You're not linked to a channel/group yet.\n\n"
-            "Use /start and select *Subscribe to a Channel/Group* to get started.",
-            parse_mode="Markdown")
+        await update.message.reply_text("⚠️ You're not linked to a channel/group yet. Use /start.", parse_mode="Markdown")
         return
 
     client = get_client(client_id)
@@ -1877,21 +1857,30 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_clientlist(update, context)
         return
     if not is_active_client(uid):
-        await update.message.reply_text("⚠️ No active subscription. Use /pay to get started.")
+        await update.message.reply_text("⚠️ No active subscription.")
         return
+        
     await context.bot.send_chat_action(uid, "typing")
     update_last_seen(uid)
-    members = db.table("members").select("user_id, username, expiry, package").eq("client_id", uid).eq("removed", False).order("expiry").execute().data
+    
+    members = db.table("members").select("username, expiry, removed, package") \
+                                 .eq("client_id", uid).order("removed").execute().data
+                                 
     if not members:
-        await update.message.reply_text("📭 No active members yet.")
+        await update.message.reply_text("📭 No members found.")
         return
-    lines = ["👥 *Your Active Members:*\n"]
+        
+    lines = ["👥 *Your Member Ledger:*\n"]
     for m in members:
-        if not m["expiry"]:
-            lines.append(f"• {m['username'] or m['user_id']} — {m.get('package','?')} (⏳ pending join)")
+        if m["removed"]:
+            status_str = "🚪 Removed"
         else:
-            countdown = format_expiry_countdown(m["expiry"])
-            lines.append(f"• {m['username'] or m['user_id']} — {m.get('package','?')} ({countdown} left)")
+            # Show countdown for active members
+            countdown = format_expiry_countdown(m["expiry"]) if m["expiry"] else "Pending"
+            status_str = f"✅ Active ({countdown} left)"
+            
+        lines.append(f"• {m['username'] or 'Unknown'} — {m.get('package','?')} | {status_str}")
+        
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1927,15 +1916,28 @@ async def cmd_clientlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     await context.bot.send_chat_action(update.effective_user.id, "typing")
-    now     = datetime.now(timezone.utc).isoformat()
-    clients = db.table("clients").select("client_id, username, expiry, plan, brand_name, ref_code").gt("expiry", now).eq("removed", False).order("expiry").execute().data
+    
+    # Fetch all clients, including removed ones
+    clients = db.table("clients").select("username, expiry, plan, brand_name, ref_code, removed").order("removed").execute().data
+    
     if not clients:
-        await update.message.reply_text("📭 No active clients.")
+        await update.message.reply_text("📭 No clients found in the database.")
         return
-    lines = ["👥 *Active Clients:*\n"]
+        
+    lines = ["📋 *Full Client Ledger:*\n"]
     for c in clients:
-        countdown = format_expiry_countdown(c["expiry"])
-        lines.append(f"• {c['username']} — {c['brand_name']} ({c['plan']}, {countdown} left) | 🔑 `{c.get('ref_code','N/A')}`")
+        # Determine Status and Countdown
+        if c.get("removed"):
+            status_str = "❌ Removed/Inactive"
+        else:
+            expiry_dt = datetime.fromisoformat(c["expiry"])
+            if expiry_dt > datetime.now(timezone.utc):
+                status_str = f"✅ Active ({format_expiry_countdown(c['expiry'])} left)"
+            else:
+                status_str = "⚠️ Expired"
+        
+        lines.append(f"• {c['username']} — {c['brand_name']} | {status_str} | 🔑 `{c.get('ref_code','N/A')}`")
+        
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
