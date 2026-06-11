@@ -430,7 +430,6 @@ async def _show_plan_selection(bot, uid: int, channel_name: str):
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
-# ── /start ─────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     chat = update.effective_chat
@@ -1518,8 +1517,11 @@ async def callback_client_deny(update: Update, context: ContextTypes.DEFAULT_TYP
 # ── Text handler ───────────────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
-    if await process_channel_verification(update, context, uid):
-        return
+    
+    # GUARD: Only process channel verification if they are NOT a known client
+    if not is_client(uid):
+        if await process_channel_verification(update, context, uid):
+            return
 
     text  = update.message.text or ""
     state = CLIENT_STATE.get(uid, {})
@@ -1723,8 +1725,11 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_getfileid_media(update, context)
         return
 
-    if await process_channel_verification(update, context, uid):
-        return
+    # GUARD: Only process channel verification if they are NOT a known client
+    if not is_client(uid):
+        if await process_channel_verification(update, context, uid):
+            return
+            
     if update.message.document:
         await handle_receipt(update, context)
     elif update.message.photo:
