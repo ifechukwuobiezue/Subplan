@@ -1143,9 +1143,8 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👑 You're a platform admin. No payment needed!")
         return
 
-    # NEW: CLIENT RENEWAL PATH (High priority guard)
-    if is_client(uid):
-        update_last_seen(uid)
+    existing_client = get_client(uid)
+    if existing_client:
         caption = (
             f"💳 *Renew Your SubPlanBot Subscription*\n\n"
             f"💰 Amount: ₦{PLATFORM_PRICE}/month\n\n"
@@ -1156,10 +1155,9 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Our team will extend your subscription once confirmed ✅\n\n"
             "❓ Got questions? Reach out to @GizmoBrymez"
         )
-        await update.message.reply_text(caption, parse_mode="Markdown")
+        await send_media_or_text(context.bot, uid, FLYER_FILE_ID, caption)
         return
 
-    # MEMBER PAYMENT PATH (Only reachable if user is NOT a client)
     state     = CLIENT_STATE.get(uid, {})
     client_id = state.get("subscribing_to_client_id")
     if not client_id:
@@ -1256,8 +1254,9 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state                 = CLIENT_STATE.get(uid, {})
     is_onboarding_payment = state.get("awaiting_payment", False)
+    existing_client       = get_client(uid)
 
-    if is_onboarding_payment or is_client(uid):
+    if is_onboarding_payment or existing_client:
         await update.message.reply_text(
             "✅ *Receipt received!* 📩\n\nOur team will review shortly. You'll hear back once confirmed.",
             parse_mode="Markdown")
@@ -1309,7 +1308,6 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(client_id,
         f"💳 *New Payment Receipt!*\n\n👤 {name} just sent a payment receipt for *{client['brand_name']}*.",
         parse_mode="Markdown", reply_markup=keyboard)
-
 
 # ── Member approve ─────────────────────────────────────────────────────────────
 async def callback_member_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2003,6 +2001,7 @@ def run_bot():
 
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo))
+    app.add_handler(MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF & filters.ChatType.PRIVATE, handle_receipt))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_text))
 
