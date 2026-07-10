@@ -27,8 +27,8 @@ logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
 
 # ── Platform payment account ───────────────────────────────────────────────────
 PLATFORM_BANK_NAME   = "Kuda Bank"
-PLATFORM_ACCT_NUMBER = "2003661688"
-PLATFORM_ACCT_NAME   = "Paul-Mary Chukwuka Omile"
+PLATFORM_ACCT_NUMBER = "3004015285"
+PLATFORM_ACCT_NAME   = "Pradage Ventures"
 PLATFORM_PRICE       = "3,000"
 
 # ── In-memory state ────────────────────────────────────────────────────────────
@@ -1248,7 +1248,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid  = user.id
-    name = f"@{user.username}" if user.username else user.first_name
+    raw_name = f"@{user.username}" if user.username else (user.first_name or str(user.id))
+    name = raw_name.replace(":", "_")
 
     await context.bot.send_chat_action(uid, "typing")
 
