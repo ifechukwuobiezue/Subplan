@@ -1075,7 +1075,7 @@ def _save_new_client(uid, username, state, plan, expiry, ref_code=None):
         ref_code = generate_ref_code(state.get("brand_name", "SPB"))
     packages = list(state.get("packages", []))
     packages.insert(0, {"name": "5 Min Demo", "price": "0", "duration_days": 0, "duration_minutes": 5, "is_demo": True})
-    db.table("clients").insert({
+    data = {
         "client_id":      uid,
         "username":       username_str,
         "brand_name":     state.get("brand_name"),
@@ -1093,7 +1093,12 @@ def _save_new_client(uid, username, state, plan, expiry, ref_code=None):
         "added_at":       datetime.now(timezone.utc).isoformat(),
         "removed":        False,
         "last_seen":      datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    }
+    try:
+        result = db.table("clients").insert(data).execute()
+        logging.info(f"Client insert success: {result}")
+    except Exception as e:
+        logging.exception(f"Client insert FAILED for {uid}: {e}")
 
 
 # ── Ref code input ─────────────────────────────────────────────────────────────
