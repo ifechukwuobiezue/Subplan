@@ -25,16 +25,17 @@ db                 = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABAS
 
 logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
 
-# ── Platform payment account ───────────────────────────────────────────────────
-PLATFORM_BANK_NAME   = "Kuda Bank"
-PLATFORM_ACCT_NUMBER = "3004015285"
-PLATFORM_ACCT_NAME   = "Pradage Ventures"
-PLATFORM_PRICE       = "3,000"
+# ── Platform payment account (override via env) ────────────────────────────────
+PLATFORM_BANK_NAME   = os.getenv("PLATFORM_BANK_NAME", "Kuda Bank")
+PLATFORM_ACCT_NUMBER = os.getenv("PLATFORM_ACCT_NUMBER", "3004015285")
+PLATFORM_ACCT_NAME   = os.getenv("PLATFORM_ACCT_NAME", "Pradage Ventures")
+PLATFORM_PRICE       = os.getenv("PLATFORM_PRICE", "3,000")
 
 # ── In-memory state ────────────────────────────────────────────────────────────
-CLIENT_STATE      = {}
-ADMIN_STATE       = {}
-PENDING_APPROVALS = {}  # { user_id: { "client_id": ..., "pkg": ..., "name": ... } }
+CLIENT_STATE         = {}
+ADMIN_STATE          = {}
+PENDING_APPROVALS    = {}  # { user_id: { "client_id": ..., "pkg": ..., "name": ... } }
+INACTIVITY_NOTIFIED  = set()  # client_ids already pinged this process lifetime
 
 # Onboarding steps
 STEP_BRAND        = "brand"
@@ -126,7 +127,43 @@ def is_active_client(user_id: int) -> bool:
     return datetime.fromisoformat(c["expiry"]) > datetime.now(timezone.utc)
 
 def update_last_seen(user_id: int):
+    INACTIVITY_NOTIFIED.discard(user_id)
     db.table("clients").update({"last_seen": datetime.now(timezone.utc).isoformat()}).eq("client_id", user_id).execute()
+
+def escape_md(text) -> str:
+    """Escape Telegram legacy-Markdown special chars in dynamic text."""
+    text = str(text)
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+def safe_cb_name(text: str, max_bytes: int = 40) -> str:
+    """Truncate a name for callback_data (Telegram 64-byte hard limit)."""
+    return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+def package_delta(pkg: dict) -> timedelta:
+    if pkg.get("is_demo") or pkg.get("duration_minutes"):
+        return timedelta(minutes=int(pkg.get("duration_minutes") or 5))
+    return timedelta(days=int(pkg.get("duration_days") or 0))
+
+def member_is_currently_active(row: dict, now=None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    if row.get("removed"):
+        return False
+    if not row.get("expiry"):
+        return False
+    return datetime.fromisoformat(row["expiry"]) > now
+
+async def create_member_invite(bot, channel_id: int, user_id: int) -> str:
+    """Create a one-seat invite; fall back to join-request mode if needed."""
+    try:
+        return (await bot.create_chat_invite_link(
+            channel_id, member_limit=1, name=f"user_{user_id}"
+        )).invite_link
+    except Exception:
+        return (await bot.create_chat_invite_link(
+            channel_id, creates_join_request=True, name=f"user_{user_id}"
+        )).invite_link
 
 def generate_ref_code(brand_name: str) -> str:
     prefix = "".join(c for c in brand_name.upper() if c.isalpha())[:4]
@@ -188,9 +225,9 @@ async def send_media_or_text(bot_or_ctx, chat_id: int, file_id, caption: str,
     await bot_or_ctx.send_message(chat_id, caption, **kwargs)
 
 async def send_member_welcome(bot, user_id: int, client: dict):
-    brand   = client.get("brand_name", "the channel/group")
+    brand   = escape_md(client.get("brand_name", "the channel/group"))
     logo_id = client.get("brand_logo_id")
-    admin_u = client.get("username", "the admin")
+    admin_u = escape_md(client.get("username", "the admin"))
     text = (
         f"👋 *Welcome to {brand}!*\n\n"
         "Here are your quick action commands:\n\n"
@@ -209,16 +246,19 @@ async def send_member_welcome(bot, user_id: int, client: dict):
 
 async def _send_member_payment_info(message, client: dict):
     """Send clean payment details to a member — mirrors the old single-client bot format."""
-    admin_u   = client.get("username", "the admin")
+    admin_u   = escape_md(client.get("username", "the admin"))
     packages  = [p for p in (client.get("packages") or []) if not p.get("is_demo")]
-    pkg_lines = "\n".join([f"• *{p['name']}* — ₦{p['price']} ({format_duration(p['duration_days'])})" for p in packages])
+    pkg_lines = "\n".join([
+        f"• *{escape_md(p['name'])}* — ₦{escape_md(p['price'])} ({format_duration(p['duration_days'])})"
+        for p in packages
+    ])
 
     caption = (
-        f"💳 *Payment Details — {client['brand_name']}*\n\n"
+        f"💳 *Payment Details — {escape_md(client['brand_name'])}*\n\n"
         f"📦 *Packages:*\n{pkg_lines}\n\n"
-        f"🏦 Bank: {client['bank_name']}\n"
+        f"🏦 Bank: {escape_md(client['bank_name'])}\n"
         f"💰 Account Number: `{client['account_number']}`\n"
-        f"👤 Account Name: {client['account_name']}\n\n"
+        f"👤 Account Name: {escape_md(client['account_name'])}\n\n"
         "After payment kindly send your receipt here.\n\n"
         f"_For non-Nigerians, kindly DM {admin_u} for a different payment method._"
     )
@@ -233,19 +273,34 @@ def _kick_expired_members_sync():
     async def _do():
         async with Bot(token=BOT_TOKEN) as bot:
             now = datetime.now(timezone.utc).isoformat()
-            active_clients = db.table("clients").select("client_id, channel_id").gt("expiry", now).eq("removed", False).execute().data
-            for client in active_clients:
-                expired = db.table("members").select("user_id, username").lte("expiry", now).eq("removed", False).eq("client_id", client["client_id"]).execute().data
+            # Kick expired members for any non-removed client (active or lapsed-but-not-cleared)
+            clients = db.table("clients").select(
+                "client_id, channel_id, username"
+            ).eq("removed", False).execute().data
+            for client in clients:
+                expired = db.table("members").select("user_id, username").lte(
+                    "expiry", now
+                ).eq("removed", False).eq("client_id", client["client_id"]).execute().data
                 for m in expired:
                     try:
-                        await bot.ban_chat_member(client["channel_id"], m["user_id"])
-                        await bot.unban_chat_member(client["channel_id"], m["user_id"])
-                        db.table("members").update({"removed": True}).eq("user_id", m["user_id"]).eq("client_id", client["client_id"]).execute()
+                        if client.get("channel_id"):
+                            await bot.ban_chat_member(client["channel_id"], m["user_id"])
+                            await bot.unban_chat_member(client["channel_id"], m["user_id"])
+                        db.table("members").update({"removed": True}).eq(
+                            "user_id", m["user_id"]
+                        ).eq("client_id", client["client_id"]).execute()
+                        PENDING_APPROVALS.pop(m["user_id"], None)
                         try:
                             await bot.send_message(m["user_id"],
                                 "🚪 *Your subscription has expired.*\n\n"
                                 "You've been removed from the channel/group.\n\n"
                                 "To regain access, renew your subscription via /pay 🙏",
+                                parse_mode="Markdown")
+                        except Exception:
+                            pass
+                        try:
+                            await bot.send_message(client["client_id"],
+                                f"🚪 *Evicted:* {escape_md(m['username'] or m['user_id'])} — subscription expired.",
                                 parse_mode="Markdown")
                         except Exception:
                             pass
@@ -257,44 +312,94 @@ def _kick_expired_clients_sync():
     async def _do():
         async with Bot(token=BOT_TOKEN) as bot:
             now = datetime.now(timezone.utc).isoformat()
-            expired = db.table("clients").select("client_id, username").lte("expiry", now).eq("removed", False).execute().data
+            expired = db.table("clients").select(
+                "client_id, username, channel_id"
+            ).lte("expiry", now).eq("removed", False).execute().data
             for c in expired:
                 try:
+                    # Evict all members from this client's channel first
+                    members = db.table("members").select("user_id, username").eq(
+                        "client_id", c["client_id"]
+                    ).eq("removed", False).execute().data
+                    channel_id = c.get("channel_id")
+                    for m in members:
+                        try:
+                            if channel_id:
+                                await bot.ban_chat_member(channel_id, m["user_id"])
+                                await bot.unban_chat_member(channel_id, m["user_id"])
+                            db.table("members").update({"removed": True}).eq(
+                                "user_id", m["user_id"]
+                            ).eq("client_id", c["client_id"]).execute()
+                            PENDING_APPROVALS.pop(m["user_id"], None)
+                            try:
+                                await bot.send_message(m["user_id"],
+                                    "🚪 *Access ended.*\n\n"
+                                    "The channel/group admin's SubPlanBot subscription expired, "
+                                    "so managed access has been removed.\n\n"
+                                    "Contact the admin if you need to rejoin later.",
+                                    parse_mode="Markdown")
+                            except Exception:
+                                pass
+                        except Exception as me:
+                            logging.error(
+                                f"Failed to evict member {m['user_id']} for expired client {c['client_id']}: {me}"
+                            )
+
                     db.table("clients").update({"removed": True}).eq("client_id", c["client_id"]).execute()
                     try:
                         await bot.send_message(c["client_id"],
                             "🚪 *Your SubPlanBot subscription has expired.*\n\n"
-                            "Your channel/group is no longer being managed.\n\n"
+                            "Your channel/group is no longer being managed, and active members "
+                            "have been removed from access.\n\n"
                             "Use /pay to renew and restore full service. 🙏",
                             parse_mode="Markdown")
                     except Exception:
                         pass
                     for admin in ADMIN_IDS:
-                        await bot.send_message(admin,
-                            f"🚪 *Client evicted:* {c['username'] or c['client_id']} — subscription expired.",
-                            parse_mode="Markdown")
+                        try:
+                            await bot.send_message(admin,
+                                f"🚪 *Client evicted:* {escape_md(c['username'] or c['client_id'])} "
+                                f"— subscription expired. {len(members)} member(s) cleared.",
+                                parse_mode="Markdown")
+                        except Exception as notify_err:
+                            logging.error(f"Failed to notify admin {admin}: {notify_err}")
                 except Exception as e:
                     logging.error(f"Client kick failed for {c['client_id']}: {e}")
     asyncio.run(_do())
 
 def _remind_members_sync():
     async def _do():
-        # This handles the connection lifecycle correctly
         async with Bot(token=BOT_TOKEN) as bot:
             now = datetime.now(timezone.utc)
             for days in [7, 3, 1]:
-                # ... [The Window-Check logic we discussed] ...
                 target_time = now + timedelta(days=days)
                 start = (target_time - timedelta(hours=1)).isoformat()
                 end   = (target_time + timedelta(hours=1)).isoformat()
-                
-                members = db.table("members").select("user_id, expiry").gte("expiry", start).lte("expiry", end).eq("removed", False).execute().data
-                
+
+                members = db.table("members").select(
+                    "user_id, username, expiry, client_id"
+                ).gte("expiry", start).lte("expiry", end).eq("removed", False).execute().data
+
                 for m in members:
+                    client = get_client(m["client_id"])
+                    brand  = escape_md(client["brand_name"]) if client else "your channel/group"
+                    expiry = datetime.fromisoformat(m["expiry"]).strftime("%b %d, %Y")
                     try:
-                        await bot.send_message(m["user_id"], "⏰ Your sub expires soon. /pay", parse_mode="Markdown")
+                        await bot.send_message(m["user_id"],
+                            f"⏰ *Heads up!* Your *{brand}* subscription expires in "
+                            f"*{days} day{'s' if days > 1 else ''}* ({expiry}).\n\n"
+                            "Renew now → /pay 🙏",
+                            parse_mode="Markdown")
                     except Exception as e:
-                        logging.error(f"Reminder failed: {e}")
+                        logging.error(f"Reminder failed for {m['user_id']}: {e}")
+                        if client:
+                            try:
+                                await bot.send_message(client["client_id"],
+                                    f"⚠️ Couldn't DM {escape_md(m.get('username') or m['user_id'])} "
+                                    f"— their sub expires in {days}d.",
+                                    parse_mode="Markdown")
+                            except Exception:
+                                pass
     asyncio.run(_do())
 
 def _remind_clients_sync():
@@ -330,15 +435,21 @@ def _inactivity_sync():
     async def _do():
         async with Bot(token=BOT_TOKEN) as bot:
             threshold = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            inactive  = db.table("clients").select("client_id").lt("last_seen", threshold).eq("removed", False).execute().data
+            inactive  = db.table("clients").select("client_id").lt(
+                "last_seen", threshold
+            ).eq("removed", False).execute().data
             for c in inactive:
+                cid = c["client_id"]
+                if cid in INACTIVITY_NOTIFIED:
+                    continue
                 try:
-                    await bot.send_message(c["client_id"],
+                    await bot.send_message(cid,
                         "👋 *Hey! We miss you.*\n\n"
                         "We noticed you haven't used SubPlanBot in a while.\n\n"
                         "Your channel/group management is still running — just wanted to check in! "
                         "Type /start if you need anything 😊",
                         parse_mode="Markdown")
+                    INACTIVITY_NOTIFIED.add(cid)
                 except Exception:
                     pass
     asyncio.run(_do())
@@ -433,15 +544,15 @@ async def _show_plan_selection(bot, uid: int, channel_name: str):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     chat = update.effective_chat
-    
-    # 1. THE CLIENT GUARD: Stop clients from entering onboarding
-    if is_client(uid):
+
+    # 1. CLIENT GUARD: any existing client record (active or removed) skips onboarding
+    existing_client = get_client(uid)
+    if existing_client:
         if is_active_client(uid):
             update_last_seen(uid)
-            client = get_client(uid)
-            ref    = client.get("ref_code", "N/A")
+            ref = existing_client.get("ref_code", "N/A")
             await update.message.reply_text(
-                f"👋 *Welcome back, {client.get('brand_name', 'there')}!*\n\n"
+                f"👋 *Welcome back, {escape_md(existing_client.get('brand_name', 'there'))}!*\n\n"
                 "📋 /list — view active members\n"
                 "❌ /remove — remove a member\n"
                 "⚙️ /settings — manage brand, packages & payment info\n"
@@ -459,9 +570,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
-    # 2. ORIGINAL ONBOARDING LOGIC (Preserved exactly as you had it)
-    user = update.effective_user
-    chat = update.effective_chat
+    # 2. Onboarding / member entry
 
     if chat.type in ("group", "supergroup"):
         state = CLIENT_STATE.get(uid, {})
@@ -536,12 +645,12 @@ async def callback_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(uid, "typing")
 
     if action == "admin":
-        if is_active_client(uid):
+        existing_client = get_client(uid)
+        if existing_client and is_active_client(uid):
             update_last_seen(uid)
-            client = get_client(uid)
-            ref    = client.get("ref_code", "N/A")
-            msg    = (
-                f"👋 *Welcome back, {client.get('brand_name', 'there')}!*\n\n"
+            ref = existing_client.get("ref_code", "N/A")
+            msg = (
+                f"👋 *Welcome back, {escape_md(existing_client.get('brand_name', 'there'))}!*\n\n"
                 "📋 /list — view your active members\n"
                 "❌ /remove [id] — remove a member\n"
                 "⚙️ /settings — manage brand, packages & payment info\n"
@@ -556,7 +665,7 @@ async def callback_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(msg, parse_mode="Markdown")
             return
 
-        if is_client(uid):
+        if existing_client:
             msg = (
                 "⚠️ *Your SubPlanBot subscription has expired.*\n\n"
                 "Use /pay to renew.\n\n"
@@ -834,26 +943,42 @@ async def handle_member_joined(update: Update, context: ContextTypes.DEFAULT_TYP
     if user_id == context.bot.id:
         return
 
-    pending = PENDING_APPROVALS.get(user_id)
-    if not pending:
-        return
+    # Resolve pending approval from memory, or DB row with null expiry (restart-safe)
+    pending   = PENDING_APPROVALS.get(user_id)
+    client_id = None
+    pkg       = None
+    name      = None
 
-    client_id = pending["client_id"]
-    pkg       = pending["pkg"]
-    name      = pending["name"]
+    if pending:
+        client_id = pending["client_id"]
+        pkg       = pending["pkg"]
+        name      = pending["name"]
+        client    = get_client(client_id)
+        if not client or client.get("channel_id") != chat_id:
+            return
+    else:
+        clients = db.table("clients").select("*").eq("channel_id", chat_id).eq("removed", False).execute().data
+        if not clients:
+            return
+        client    = clients[0]
+        client_id = client["client_id"]
+        existing  = db.table("members").select("*").eq("user_id", user_id).eq("client_id", client_id).execute().data
+        if not existing or existing[0].get("expiry") is not None:
+            return  # not a pending-join approval
+        name = existing[0].get("username") or str(user_id)
+        pkg_name = existing[0].get("package")
+        pkg = next((p for p in (client.get("packages") or []) if p.get("name") == pkg_name), None)
+        if not pkg:
+            # Fallback: treat stored package as paid days unknown → 0 demo minutes unsafe; use 1 day
+            pkg = {"name": pkg_name or "Approved", "duration_days": 1, "is_demo": False}
 
-    client = get_client(client_id)
-    if not client or client["channel_id"] != chat_id:
-        return
-
-    now    = datetime.now(timezone.utc)
-    delta  = timedelta(minutes=5) if pkg.get("is_demo") else timedelta(days=pkg["duration_days"])
+    now   = datetime.now(timezone.utc)
+    delta = package_delta(pkg)
+    # Timer starts at join (not approve)
     expiry = now + delta
 
     existing = db.table("members").select("expiry").eq("user_id", user_id).eq("client_id", client_id).execute().data
     if existing:
-        base   = datetime.fromisoformat(existing[0]["expiry"]) if existing[0]["expiry"] else now
-        expiry = (base if base > now else now) + delta
         db.table("members").update({
             "expiry": expiry.isoformat(), "joined_at": now.isoformat(),
             "package": pkg["name"], "removed": False, "username": name
@@ -872,6 +997,12 @@ async def handle_member_joined(update: Update, context: ContextTypes.DEFAULT_TYP
 
     PENDING_APPROVALS.pop(user_id, None)
     logging.info(f"Member {user_id} joined — expiry set to {expiry.isoformat()}")
+    try:
+        await context.bot.send_message(client_id,
+            f"✅ {escape_md(name)} joined — timer started. Expires `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`.",
+            parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 # ── Callback: onboarding ───────────────────────────────────────────────────────
@@ -1255,6 +1386,7 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = user.id
     raw_name = f"@{user.username}" if user.username else (user.first_name or str(user.id))
     name = raw_name.replace(":", "_")
+    cb_name = safe_cb_name(name)
 
     await context.bot.send_chat_action(uid, "typing")
 
@@ -1267,27 +1399,35 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ *Receipt received!* 📩\n\nOur team will review shortly. You'll hear back once confirmed.",
             parse_mode="Markdown")
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"client_approve:{uid}:{name}"),
-            InlineKeyboardButton("❌ Deny",    callback_data=f"client_deny:{uid}:{name}")
+            InlineKeyboardButton("✅ Approve", callback_data=f"client_approve:{uid}:{cb_name}"),
+            InlineKeyboardButton("❌ Deny",    callback_data=f"client_deny:{uid}:{cb_name}")
         ]])
         for admin in ADMIN_IDS:
-            await context.bot.forward_message(admin, update.effective_chat.id, update.message.message_id)
-            await context.bot.send_message(admin,
-                f"💳 *Client payment receipt*\n\n"
-                f"👤 {name} wants to {'activate' if is_onboarding_payment else 'renew'} their SubPlanBot subscription.",
-                parse_mode="Markdown", reply_markup=keyboard)
+            try:
+                await context.bot.forward_message(admin, update.effective_chat.id, update.message.message_id)
+                await context.bot.send_message(admin,
+                    f"💳 *Client payment receipt*\n\n"
+                    f"👤 {escape_md(name)} wants to "
+                    f"{'activate' if is_onboarding_payment else 'renew'} their SubPlanBot subscription.",
+                    parse_mode="Markdown", reply_markup=keyboard)
+            except Exception as e:
+                logging.error(f"Failed to notify platform admin {admin}: {e}")
         return
 
     client_id = state.get("subscribing_to_client_id")
     if not client_id:
-        rows = db.table("members").select("client_id").eq("user_id", uid).execute().data
-        if rows:
-            client_id = rows[0]["client_id"]
+        # Prefer an active membership; otherwise most recent row
+        rows = db.table("members").select("client_id, removed, expiry").eq("user_id", uid).execute().data
+        active_rows = [r for r in rows if member_is_currently_active(r)]
+        pick = active_rows[0] if active_rows else (rows[0] if rows else None)
+        if pick:
+            client_id = pick["client_id"]
 
     if not client_id:
         await update.message.reply_text(
-            "✅ Receipt received! The Admin will review and grant you access within 2hrs. "
-            "If you don't hear back, contact the admin with your payment details.",
+            "⚠️ *You're not linked to a channel/group yet.*\n\n"
+            "Use /start → *Subscribe to a Channel/Group* (or open your admin's deep link), "
+            "then send your receipt again so it reaches the right admin.",
             parse_mode="Markdown")
         return
 
@@ -1302,18 +1442,25 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ *Receipt received!* 📩\n\n"
-        f"The admin ({admin_u}) will review and send your invite link within 2 hours. "
+        f"The admin ({escape_md(admin_u)}) will review and send your invite link within 2 hours. "
         f"If you don't hear back, contact them with your payment details.",
         parse_mode="Markdown")
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"member_approve:{uid}:{name}:{client_id}"),
-        InlineKeyboardButton("❌ Deny",    callback_data=f"member_deny:{uid}:{name}:{client_id}")
+        InlineKeyboardButton("✅ Approve", callback_data=f"member_approve:{uid}:{cb_name}:{client_id}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"member_deny:{uid}:{cb_name}:{client_id}")
     ]])
-    await context.bot.forward_message(client_id, update.effective_chat.id, update.message.message_id)
-    await context.bot.send_message(client_id,
-        f"💳 *New Payment Receipt!*\n\n👤 {name} just sent a payment receipt for *{client['brand_name']}*.",
-        parse_mode="Markdown", reply_markup=keyboard)
+    try:
+        await context.bot.forward_message(client_id, update.effective_chat.id, update.message.message_id)
+        await context.bot.send_message(client_id,
+            f"💳 *New Payment Receipt!*\n\n"
+            f"👤 {escape_md(name)} just sent a payment receipt for *{escape_md(client['brand_name'])}*.",
+            parse_mode="Markdown", reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Failed to notify client {client_id} of receipt: {e}")
+        await update.message.reply_text(
+            "⚠️ We couldn't reach your channel admin automatically. "
+            "Please DM them your receipt directly.")
 
 # ── Member approve ─────────────────────────────────────────────────────────────
 async def callback_member_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1338,11 +1485,25 @@ async def callback_member_approve(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⚠️ No packages set up. Use /settings to add packages.")
         return
 
+    existing = db.table("members").select("package, expiry, removed").eq(
+        "user_id", user_id
+    ).eq("client_id", client_id).execute().data
+    current_note = ""
+    if existing and member_is_currently_active(existing[0]):
+        current_note = (
+            f"📌 *Currently on:* {escape_md(existing[0].get('package', '?'))} "
+            f"({format_expiry_countdown(existing[0]['expiry'])} left)\n\n"
+        )
+
     is_test  = client.get("plan") == "test"
+    cb_name  = safe_cb_name(name)
     keyboard = []
     for i, p in enumerate(packages):
         is_demo = p.get("is_demo", False)
-        label   = f"{p['name']} — {'Free' if is_demo else '₦'+p['price']} ({format_duration(p['duration_days'] if not is_demo else 0)})"
+        label   = (
+            f"{p['name']} — {'Free' if is_demo else '₦' + str(p['price'])} "
+            f"({format_duration(0 if is_demo else p['duration_days'])})"
+        )
         if is_test and not is_demo:
             keyboard.append([InlineKeyboardButton(
                 f"🔒 {label} (test mode only)",
@@ -1351,11 +1512,11 @@ async def callback_member_approve(update: Update, context: ContextTypes.DEFAULT_
         else:
             keyboard.append([InlineKeyboardButton(
                 label,
-                callback_data=f"member_pkg:{user_id}:{i}:{client_id}:{name}"
+                callback_data=f"member_pkg:{user_id}:{i}:{client_id}:{cb_name}"
             )])
 
     await query.edit_message_text(
-        f"📦 Select package for {name}:"
+        f"{current_note}📦 Select package for {escape_md(name)}:"
         + ("\n\n_🔒 Custom packages are disabled during the Test Environment._" if is_test else ""),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1373,77 +1534,119 @@ async def callback_member_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id   = int(parts[1])
     pkg_idx   = int(parts[2])
     client_id = int(parts[3])
-    name      = parts[4]
+    name      = parts[4] if len(parts) > 4 else str(user_id)
+
+    if query.from_user.id != client_id and query.from_user.id not in ADMIN_IDS:
+        return
 
     await context.bot.send_chat_action(query.from_user.id, "typing")
     client = get_client(client_id)
-    pkg    = client["packages"][pkg_idx]
-    now    = datetime.now(timezone.utc)
+    if not client:
+        await query.edit_message_text("⚠️ Client not found.")
+        return
 
-    # 1. Calculate the new time to add (delta)
-    delta = timedelta(minutes=5) if pkg.get("is_demo") else timedelta(days=pkg["duration_days"])
-    
-    # 2. Look for existing record in THIS specific channel
-    existing = db.table("members").select("expiry, removed").eq("user_id", user_id).eq("client_id", client_id).execute().data
-    
-    is_active = False
-    if existing:
-        m = existing[0]
-        is_active = not m["removed"]
-        
-        # Cumulative Math: Add time to existing expiry or 'now'
-        base   = datetime.fromisoformat(m["expiry"]) if m.get("expiry") else now
-        expiry = (base if base > now else now) + delta
-        
+    packages = client.get("packages") or []
+    if pkg_idx < 0 or pkg_idx >= len(packages):
+        await query.edit_message_text("⚠️ Package not found. Try Approve again.")
+        return
+
+    pkg = packages[pkg_idx]
+    now = datetime.now(timezone.utc)
+    delta = package_delta(pkg)
+
+    existing = db.table("members").select("expiry, removed, package").eq(
+        "user_id", user_id
+    ).eq("client_id", client_id).execute().data
+    is_active = bool(existing and member_is_currently_active(existing[0], now))
+
+    # ── Active renewal: extend immediately, no new invite ──────────────────────
+    if is_active:
+        base   = datetime.fromisoformat(existing[0]["expiry"])
+        expiry = base + delta
         db.table("members").update({
             "expiry": expiry.isoformat(),
-            "removed": False
+            "package": pkg["name"],
+            "removed": False,
+            "username": name,
         }).eq("user_id", user_id).eq("client_id", client_id).execute()
-    else:
-        # New record creation
-        expiry = now + delta
-        db.table("members").insert({
-            "user_id": user_id, "client_id": client_id, "username": name,
-            "package": pkg["name"], "expiry": expiry.isoformat(),
-            "added_at": now.isoformat(), "removed": False
-        }).execute()
-        is_active = False
-
-    # 3. Decision: Send Message/Link + Handle Demo Notification
-    try:
-        if is_active:
-            # Silent extension for existing members
+        try:
             await context.bot.send_message(user_id,
                 f"🎉 *Subscription Extended!*\n\n"
-                f"Your subscription has been successfully extended.\n"
+                f"Extended by *{escape_md(pkg['name'])}*.\n"
                 f"New expiry: `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
                 "You do not need to rejoin. Keep enjoying the content! 🙌",
                 parse_mode="Markdown")
-        else:
-            # New/Re-joining members get a fresh link
-            link = (await context.bot.create_chat_invite_link(
-                client["channel_id"], member_limit=1, name=f"user_{user_id}"
-            )).invite_link
-            
-            await send_member_welcome(context.bot, user_id, client)
-            await context.bot.send_message(user_id,
-                f"🎉 *Payment Approved!*\n\n"
-                f"Your subscription is active until `{expiry.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
-                f"👇 Tap below to join:\n{link}",
+            await query.edit_message_text(
+                f"✅ {escape_md(name)} extended on *{escape_md(pkg['name'])}*.",
                 parse_mode="Markdown")
+        except Exception as e:
+            await query.edit_message_text(
+                f"✅ *Already saved* — do not tap Approve again.\n\n"
+                f"Couldn't DM {escape_md(name)}:\n`{e}`",
+                parse_mode="Markdown")
+        return
 
-            # Demo notification to the Client (Admin)
-            if pkg.get("is_demo"):
-                await context.bot.send_message(client_id,
-                    "🎊 *Onboarding complete!*\n\n"
-                    "Your test member has received their invite link. ✅\n\n"
-                    "The test member will be automatically removed 5 minutes after joining.\n\n"
-                    "Ready to go live? Use /pay to activate your full monthly plan 💳",
-                    parse_mode="Markdown")
-
-        await query.edit_message_text(f"✅ {name} extended/updated successfully.", parse_mode="Markdown")
+    # ── New / rejoin: invite FIRST, timer starts on join ───────────────────────
+    try:
+        link = await create_member_invite(context.bot, client["channel_id"], user_id)
     except Exception as e:
-        await query.edit_message_text(f"✅ Processed for {name}, but messaging failed:\n`{e}`", parse_mode="Markdown")
+        await query.edit_message_text(
+            f"⚠️ Couldn't generate an invite link — *nothing was saved*.\n\n"
+            f"`{e}`\n\n"
+            "Check that the bot is admin with invite permission, and try Approve again.",
+            parse_mode="Markdown")
+        return
+
+    PENDING_APPROVALS[user_id] = {
+        "client_id": client_id,
+        "pkg": pkg,
+        "name": name,
+    }
+
+    # Persist pending membership with null expiry (survives bot restart).
+    # If the column is NOT NULL, memory PENDING_APPROVALS still covers this process.
+    try:
+        if existing:
+            db.table("members").update({
+                "expiry": None,
+                "package": pkg["name"],
+                "removed": False,
+                "username": name,
+            }).eq("user_id", user_id).eq("client_id", client_id).execute()
+        else:
+            db.table("members").insert({
+                "user_id": user_id, "client_id": client_id, "username": name,
+                "package": pkg["name"], "expiry": None,
+                "added_at": now.isoformat(), "removed": False,
+            }).execute()
+    except Exception as db_err:
+        logging.warning(f"Pending membership DB write failed (null expiry?): {db_err}")
+
+    dm_text = (
+        f"🎉 *Payment Approved!*\n\n"
+        f"Package: *{escape_md(pkg['name'])}*\n\n"
+        f"👇 Tap below to join — your timer starts when you enter:\n{escape_md(link)}"
+    )
+    try:
+        await send_member_welcome(context.bot, user_id, client)
+        await context.bot.send_message(user_id, dm_text, parse_mode="Markdown")
+        if pkg.get("is_demo"):
+            await context.bot.send_message(client_id,
+                "🎊 *Invite sent to your test member!*\n\n"
+                "Their timer starts when they *join* the channel/group "
+                "(≈5 minutes of access after joining).\n\n"
+                "Ready to go live? Use /pay to activate your full monthly plan 💳",
+                parse_mode="Markdown")
+        await query.edit_message_text(
+            f"✅ {escape_md(name)} approved on *{escape_md(pkg['name'])}*. "
+            "Invite sent — timer starts when they join.",
+            parse_mode="Markdown")
+    except Exception as e:
+        await query.edit_message_text(
+            f"✅ *Already saved* — do not tap Approve again.\n\n"
+            f"Couldn't DM {escape_md(name)} directly:\n`{e}`\n\n"
+            f"Send them this link manually:\n{escape_md(link)}",
+            parse_mode="Markdown")
 
 
 async def callback_member_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1491,17 +1694,23 @@ async def callback_client_approve(update: Update, context: ContextTypes.DEFAULT_
         _save_new_client(client_id, name.lstrip("@"), state, plan="paid", expiry=expiry, ref_code=ref_code)
         CLIENT_STATE.pop(client_id, None)
 
-    await context.bot.send_message(client_id,
-        f"🎉 *Payment Approved!*\n\n"
-        f"✅ Your SubPlanBot subscription is active until `{expiry.strftime('%b %d, %Y')}`\n\n"
-        f"🔑 *Your Ref Code:* `{ref_code}`\n"
-        f"🔗 *Deep Link:* `{ref_deep_link(ref_code)}`\n"
-        "_Share these with your members so they can subscribe instantly._\n\n"
-        "❓ Got questions? Reach out to @GizmoBrymez",
-        parse_mode="Markdown")
-    await query.edit_message_text(
-        f"✅ {name} approved. Subscription active until {expiry.strftime('%b %d, %Y')}.",
-        parse_mode="Markdown")
+    try:
+        await context.bot.send_message(client_id,
+            f"🎉 *Payment Approved!*\n\n"
+            f"✅ Your SubPlanBot subscription is active until `{expiry.strftime('%b %d, %Y')}`\n\n"
+            f"🔑 *Your Ref Code:* `{ref_code}`\n"
+            f"🔗 *Deep Link:* `{ref_deep_link(ref_code)}`\n"
+            "_Share these with your members so they can subscribe instantly._\n\n"
+            "❓ Got questions? Reach out to @GizmoBrymez",
+            parse_mode="Markdown")
+        await query.edit_message_text(
+            f"✅ {escape_md(name)} approved. Subscription active until {expiry.strftime('%b %d, %Y')}.",
+            parse_mode="Markdown")
+    except Exception as e:
+        await query.edit_message_text(
+            f"✅ *Saved* for {escape_md(name)} until {expiry.strftime('%b %d, %Y')}, "
+            f"but DM failed:\n`{e}`",
+            parse_mode="Markdown")
 
 
 async def callback_client_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1536,7 +1745,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = ADMIN_STATE.pop(uid)
             try:
                 await context.bot.send_message(s["user_id"],
-                    f"❌ *Payment Denied*\n\nReason: _{text}_\n\nContact your channel/group admin for help.",
+                    f"❌ *Payment Denied*\n\nReason: _{escape_md(text)}_\n\n"
+                    "Contact your channel/group admin for help.",
                     parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Reason sent to {s['username']}.")
             except Exception:
@@ -1546,7 +1756,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = ADMIN_STATE.pop(uid)
             try:
                 await context.bot.send_message(s["user_id"],
-                    f"❌ *Payment Denied*\n\nReason: _{text}_\n\nContact @GizmoBrymez for help.",
+                    f"❌ *Payment Denied*\n\nReason: _{escape_md(text)}_\n\n"
+                    "Contact @GizmoBrymez for help.",
                     parse_mode="Markdown")
                 await update.message.reply_text(f"✅ Reason sent to {s['username']}.")
             except Exception:
@@ -1878,34 +2089,73 @@ async def callback_del_pkg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /list ─────────────────────────────────────────────────────────────────────
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid in ADMIN_IDS:
+    if uid in ADMIN_IDS and not is_active_client(uid):
         await cmd_clientlist(update, context)
         return
     if not is_active_client(uid):
         await update.message.reply_text("⚠️ No active subscription.")
         return
-        
+
     await context.bot.send_chat_action(uid, "typing")
     update_last_seen(uid)
-    
+
     members = db.table("members").select("username, expiry, removed, package") \
-                                 .eq("client_id", uid).order("removed").execute().data
-                                 
+                                 .eq("client_id", uid).execute().data
+
     if not members:
         await update.message.reply_text("📭 No members found.")
         return
-        
-    lines = ["👥 *Your Member Ledger:*\n"]
+
+    now = datetime.now(timezone.utc)
+    active, pending, removed = [], [], []
     for m in members:
-        if m["removed"]:
-            status_str = "🚪 Removed"
+        if m.get("removed"):
+            removed.append(m)
+        elif not m.get("expiry"):
+            pending.append(m)
+        elif datetime.fromisoformat(m["expiry"]) > now:
+            active.append(m)
         else:
-            # Show countdown for active members
-            countdown = format_expiry_countdown(m["expiry"]) if m["expiry"] else "Pending"
-            status_str = f"✅ Active ({countdown} left)"
-            
-        lines.append(f"• {m['username'] or 'Unknown'} — {m.get('package','?')} | {status_str}")
-        
+            removed.append(m)  # expired but not yet kicked
+
+    active.sort(key=lambda m: m["expiry"])
+
+    divider = "━━━━━━━━━━━━━━━━"
+    lines = ["👥 *MEMBER LEDGER*", divider]
+    sn = 1
+
+    if active:
+        lines.append("🟢 *ACTIVE*")
+        for m in active:
+            lines.append(
+                f"{sn}. 👤 {escape_md(m['username'] or 'Unknown')} — "
+                f"📦 {escape_md(m.get('package', '?'))} · "
+                f"⏳ {format_expiry_countdown(m['expiry'])} left"
+            )
+            sn += 1
+
+    if pending:
+        if active:
+            lines.append(divider)
+        lines.append("⏳ *PENDING JOIN*")
+        for m in pending:
+            lines.append(
+                f"{sn}. 👤 {escape_md(m['username'] or 'Unknown')} — "
+                f"📦 {escape_md(m.get('package', '?'))}"
+            )
+            sn += 1
+
+    if removed:
+        if active or pending:
+            lines.append(divider)
+        lines.append("🗃 *REMOVED / EXPIRED*")
+        for m in removed:
+            lines.append(
+                f"{sn}. 👤 {escape_md(m['username'] or 'Unknown')} — "
+                f"📦 {escape_md(m.get('package', '?'))}"
+            )
+            sn += 1
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1916,23 +2166,53 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No active subscription.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /remove [user_id]")
+        if uid in ADMIN_IDS:
+            await update.message.reply_text("Usage: /remove [user_id] [client_id]")
+        else:
+            await update.message.reply_text("Usage: /remove [user_id]")
         return
+
     await context.bot.send_chat_action(uid, "typing")
-    target_id  = int(context.args[0])
-    client     = get_client(uid) if uid not in ADMIN_IDS else None
-    channel_id = client["channel_id"] if client else None
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ user_id must be numeric.")
+        return
+
+    if uid in ADMIN_IDS and not is_active_client(uid):
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /remove [user_id] [client_id]")
+            return
+        try:
+            owner_id = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("⚠️ client_id must be numeric.")
+            return
+        client = get_client(owner_id)
+    else:
+        owner_id = uid
+        client = get_client(uid)
+
+    channel_id = client.get("channel_id") if client else None
     if not channel_id:
         await update.message.reply_text("⚠️ No channel/group linked.")
         return
-    await context.bot.ban_chat_member(channel_id, target_id)
-    await context.bot.unban_chat_member(channel_id, target_id)
-    db.table("members").update({"removed": True}).eq("user_id", target_id).eq("client_id", uid).execute()
-    PENDING_APPROVALS.pop(target_id, None)
-    await update.message.reply_text(
-        f"✅ `{target_id}` removed from your channel/group.",
-        parse_mode="Markdown")
-    if uid not in ADMIN_IDS:
+
+    try:
+        await context.bot.ban_chat_member(channel_id, target_id)
+        await context.bot.unban_chat_member(channel_id, target_id)
+        db.table("members").update({"removed": True}).eq(
+            "user_id", target_id
+        ).eq("client_id", owner_id).execute()
+        PENDING_APPROVALS.pop(target_id, None)
+        await update.message.reply_text(
+            f"✅ `{target_id}` removed from the channel/group.",
+            parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ Couldn't remove `{target_id}`:\n`{e}`",
+            parse_mode="Markdown")
+    if is_active_client(uid):
         update_last_seen(uid)
 
 
@@ -1961,8 +2241,11 @@ async def cmd_clientlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 status_str = "⚠️ Expired"
         
-        lines.append(f"• {c['username']} — {c['brand_name']} | {status_str} | 🔑 `{c.get('ref_code','N/A')}`")
-        
+        lines.append(
+            f"• {escape_md(c['username'])} — {escape_md(c['brand_name'])} | "
+            f"{status_str} | 🔑 `{c.get('ref_code', 'N/A')}`"
+        )
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
